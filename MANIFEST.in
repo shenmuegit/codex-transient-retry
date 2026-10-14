@@ -1,3 +1,4 @@
 include Enable.ps1 Disable.ps1 LICENSE CHANGELOG.md .gitignore .gitattributes
+include README.zh-CN.md
 recursive-include docs *.md
 recursive-include tests *.py *.ps1

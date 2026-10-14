@@ -1,67 +1,171 @@
 # Codex Transient Retry
 
 [![CI](https://github.com/shenmuegit/codex-transient-retry/actions/workflows/ci.yml/badge.svg)](https://github.com/shenmuegit/codex-transient-retry/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](pyproject.toml)
+[![Windows](https://img.shields.io/badge/Platform-Windows-blue)](docs/windows.md)
+[![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-为 Codex 的模型请求和远程上下文压缩增加本地故障重试。复用现有 ChatGPT 登录，保留原模型选择，通过完整缓冲一次模型响应，避免将失败尝试中的部分工具调用提前交给客户端。
+为 Codex 的模型请求和远程上下文压缩增加本地自动重试，缓解容量不足、临时服务端错误和响应中断。适用于使用 ChatGPT 登录的 Windows Codex 客户端，复用现有登录状态与模型选择，运行时仅依赖 Python 标准库。
 
-项目版本为 `0.5.0`，服务修订号为 5。运行时仅使用 Python 标准库；Windows 启停脚本负责计划任务和配置回滚。本项目是非官方本机辅助工具，依赖 Codex 后端接口及客户端的 HTTP 回退行为。
+**每次模型响应完整接收后才交给客户端，文字和工具调用会延后显示。** 本项目是非官方辅助工具，依赖 Codex 后端接口及客户端的 HTTP 回退行为。
 
-## 原理
+## 目录
 
-```mermaid
-flowchart LR
-    A[Codex 客户端] --> B[本地重试代理 127.0.0.1:18761]
-    B --> C[环境或系统配置的网络代理]
-    C --> D[OpenAI Codex 服务]
-    B --> E[完整缓冲与错误识别]
-    E --> F[成功响应交给客户端]
-    E --> G[短暂故障等待后重试]
-    G --> B
-```
+- [功能与适用范围](#功能与适用范围)
+- [快速开始](#快速开始)
+- [停止并回滚](#停止并回滚)
+- [工作方式](#工作方式)
+- [重试策略与支持路由](#重试策略与支持路由)
+- [配置与运行数据](#配置与运行数据)
+- [排查问题](#排查问题)
+- [开发与测试](#开发与测试)
+- [相关文档](#相关文档)
+- [许可证](#许可证)
 
-代理接收 Codex 携带的鉴权信息，转发到固定的 `https://chatgpt.com/backend-api/codex`。它会检查 HTTP 状态、JSON 错误和 SSE 事件；对可识别的容量不足、临时服务端错误和响应中断最多重试 3 次，依次等待 30、60、120 秒。不可重试错误直接返回，重试耗尽后返回明确的本地上限错误。
+## 功能与适用范围
 
-缓冲单位是**一次模型请求**，并非整段会话。文字、推理和工具调用会在该次成功响应完整接收后显示。重试过程中丢弃失败尝试的缓冲内容，避免在本机执行其中的部分工具调用；服务端已经执行的操作无法回滚。
+本工具面向个人本机使用，主要处理以下情况：
 
-## 支持范围
+- 对可识别的模型容量不足、服务过载和断流自动重试，覆盖模型回复与远程上下文压缩
+- 完整缓冲单次响应，丢弃失败尝试中的部分输出，避免提前执行其中的本机工具调用
+- 使用 Windows 计划任务在登录时启动，备份配置并支持关闭与回滚
 
-| 请求 | 处理方式 |
-|---|---|
-| `POST /backend-api/codex/responses` | 缓冲响应，识别短暂故障并重试 |
-| `POST /backend-api/codex/responses/compact` | 远程上下文压缩请求重试 |
-| `GET /backend-api/codex/models` | 单次转发，有效的模型列表按凭据和账户头隔离缓存 5 分钟，连接及读取空闲超时 3 秒 |
-| `GET /health` | 查看进程、代理协议版本和重试参数 |
+持续故障仍可能耗尽重试。身份验证失败、额度不足、上下文超限和无效请求等明确错误直接返回；其他后端路由及登录方式不在当前验收范围内。
 
-身份验证失败、额度不足、上下文超限和无效请求等错误不会由本代理重试。完整规则及限制见 [实现原理](docs/architecture.md)。
+## 快速开始
 
-## Windows 启用
+启用前准备以下环境：
 
-需要 Python 3.11+（含 `pythonw.exe`）、已登录 ChatGPT 的 Codex，以及可用的 Windows 计划任务。`python` 和 `codex` 应在 PATH 中。
+- Windows，且当前账户可以创建计划任务
+- Git 和 Python 3.11+，Python 安装目录包含 `pythonw.exe`
+- 已使用 ChatGPT 登录的 Codex，`python` 和 `codex` 均可从 PowerShell 调用
+- 可访问 OpenAI 服务的网络；需要出站代理时，使用现有环境或系统代理设置
 
-在项目目录运行：
+如果已经从其他目录部署本工具，先按 [Windows 部署与迁移](docs/windows.md#从旧目录迁移) 操作。
+
+### 1. 获取源码并检查命令
+
+将仓库克隆到准备长期保留的目录，然后确认 Python 和 Codex 命令可用：
 
 ```powershell
+git clone https://github.com/shenmuegit/codex-transient-retry.git
+Set-Location codex-transient-retry
 python --version
 codex --version
-powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Enable.ps1
-Invoke-RestMethod 'http://127.0.0.1:18761/health'
 ```
 
-启用脚本创建当前用户登录时运行的 `CodexTransientRetry` 任务，备份 Codex 配置，并将内置 OpenAI 地址指向本地代理。缺失配置文件时会创建空配置作为起点。默认 provider 保持为内置 `openai`；附加 provider 用于兼容保存了旧选择的聊天。启用后完全退出并重新打开 Codex，加载新的连接配置。
+计划任务直接引用该目录中的源文件。安装期间及启用后不要移动或删除目录；运行代理无需执行 `pip install`。
 
-示例中的执行策略仅作用于该 PowerShell 进程，不修改持久策略。如果本机已经从另一个目录部署本程序，先阅读 [部署与迁移](docs/windows.md)；脚本会检查计划任务归属，拒绝跨安装覆盖或卸载。
+### 2. 启用代理
 
-## 关闭与回滚
+先结束正在进行的模型任务并完全退出 Codex，再在项目目录执行：
 
-先结束正在进行的任务并退出 Codex，再运行：
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Enable.ps1
+```
+
+脚本创建 `CodexTransientRetry` 登录任务，确认代理启动后备份并修改 Codex 配置。默认模型提供方保持为内置 `openai`，连接地址改为本地代理。执行策略只作用于当前 PowerShell 进程，不修改系统持久策略。
+
+### 3. 确认状态并重新打开 Codex
+
+检查健康端点和计划任务：
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:18761/health'
+Get-ScheduledTask -TaskName 'CodexTransientRetry'
+```
+
+健康检查应返回 `service: codex-transient-retry` 和 `version: 5`。这里的 `version` 是服务修订号，项目发行版本为 `0.5.0`。确认后重新打开 Codex，使新连接使用本地代理。
+
+## 停止并回滚
+
+先结束模型任务并退出 Codex，再从原安装目录运行关闭脚本：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Disable.ps1
 ```
 
-回滚只移除本程序管理的配置块，保留其他设置；手动修改过管理块时会拒绝覆盖。原始备份继续保留在 Codex 配置文件旁。详情见 [部署与迁移](docs/windows.md)。
+脚本移除本工具管理的配置块及计划任务，并请求代理退出；其他配置和历史备份保留。随后重新打开 Codex，加载恢复后的连接配置。
+
+如果管理块经过手动编辑，脚本会拒绝覆盖。跨目录安装、升级及校验失败的处理方式见 [Windows 部署与迁移](docs/windows.md)。
+
+## 工作方式
+
+Codex 将单次模型请求发送到本地代理。代理转发原有鉴权头，完整接收响应并检查结果，再决定返回或重试：
+
+```mermaid
+flowchart TD
+    C[Codex 客户端] --> P[本地代理 127.0.0.1:18761]
+    P --> U[OpenAI Codex 服务]
+    U --> B[完整缓冲并检查响应]
+    B -->|成功或不可重试| C
+    B -->|可重试的短暂故障| R{还有重试预算}
+    R -->|有| W[丢弃本次缓冲并等待]
+    W --> P
+    R -->|耗尽| E[返回本地重试上限错误]
+    E --> C
+```
+
+上游固定为 `https://chatgpt.com/backend-api/codex`。出站连接可使用环境或系统配置的网络代理；本工具不配置代理软件或选择节点。
+
+缓冲单位是一次模型请求。失败尝试的部分文字与本机工具调用不会提前下发；服务端已执行的操作无法回滚，后端请求也可能执行多次。协议解析及 HTTP 回退细节见 [实现原理](docs/architecture.md)。
+
+## 重试策略与支持路由
+
+模型与压缩请求使用以下默认策略，有效的 `Retry-After` 可以延长等待：
+
+| 项目 | 行为 |
+| --- | --- |
+| 尝试次数 | 最多 4 次，即首次请求加 3 次重试 |
+| 重试等待 | 依次等待 30、60、120 秒 |
+| 可重试故障 | 可识别的容量不足、服务过载、临时服务错误、连接或响应中断 |
+| 明确不可重试的错误 | 身份验证失败、额度不足、上下文超限、模型不存在、无效请求等 |
+| 重试耗尽 | 返回 `local_retry_limit_exceeded`，包含尝试次数和最后原因 |
+
+当前支持以下路由，模型列表请求单独使用较短的超时：
+
+| 请求 | 处理方式 |
+| --- | --- |
+| `POST /backend-api/codex/responses` | 缓冲模型响应并重试短暂故障 |
+| `POST /backend-api/codex/responses/compact` | 缓冲远程上下文压缩响应并重试短暂故障 |
+| `GET /backend-api/codex/models` | 单次转发；有效列表按凭据及账户隔离缓存 5 分钟，连接与读取空闲超时 3 秒 |
+| `GET /health` | 返回服务修订号、进程和重试参数 |
+
+推理请求的连接与读取空闲超时最多为 300 秒，重试调度预算为 900 秒。缓慢但持续传输的响应可能超出这些时间，**900 秒不是整次请求的硬性时长上限**。
+
+代理只监听本机回环地址，单次请求和响应分别限制为 64 MiB，并拒绝跟随上游重定向。它不转发 WebSocket，也没有全局并发或总内存配额；Codex 升级后需要重新验证兼容性。
+
+## 配置与运行数据
+
+配置目录默认是 `%USERPROFILE%\.codex`，也可通过 `CODEX_HOME` 指定。运行数据保存在该目录下：
+
+| 路径 | 用途 |
+| --- | --- |
+| `config.toml` | Codex 配置及本工具管理的配置块 |
+| `config.toml.retry-backup-*.bak` | 原始配置备份 |
+| `config.toml.retry-upgrade-*.bak` | 升级前配置备份 |
+| `transient-retry/config-state.json` | 配置回滚状态 |
+| `transient-retry/proxy.log` | 代理元数据日志，最多保留 3 个约 2 MiB 的文件 |
+
+日志不记录凭据、提示词或回复正文。配置备份可能包含敏感设置，应保留在本机；仓库不包含登录状态、个人配置、备份、运行日志或代理规则文件。
+
+## 排查问题
+
+先检查健康端点，再根据现象查看任务、日志或配置：
+
+| 现象 | 排查方向 |
+| --- | --- |
+| 健康检查连接失败 | 检查计划任务状态、18761 端口占用及 `proxy.log` |
+| 提示已有其他安装的计划任务 | 从旧安装目录关闭工具，再按迁移流程启用新目录 |
+| 发送请求后暂时没有文字输出 | 单次响应会完整缓冲；查看日志区分正常等待与故障重试 |
+| 返回 `local_retry_limit_exceeded` | 本次预算已耗尽，查看尝试次数与最后原因，确认上游或网络恢复后再试 |
+| 代理启动但无法访问上游 | 检查代理进程使用的环境／系统代理设置，并确保回环地址可直接访问 |
+
+更多操作见 [Windows 排查说明](docs/windows.md#常见排查)。反馈问题可提交 [GitHub Issue](https://github.com/shenmuegit/codex-transient-retry/issues)，附上版本和脱敏错误信息，保留登录文件与配置备份在本机。
 
 ## 开发与测试
+
+在项目目录创建虚拟环境，安装开发依赖后执行检查、测试和构建：
 
 ```powershell
 python -m venv .venv
@@ -72,26 +176,21 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m build
 ```
 
-测试使用本机模拟服务及临时配置，不需要 OpenAI 凭据。Windows 安装测试只在临时目录调用配置管理，并模拟计划任务和网络操作。CI 检查 Windows 的 Python 3.11／3.13、Ubuntu 的 Python 3.11，以及格式、打包和安装后的命令入口。兼容性及验收边界见 [验证记录](docs/validation.md)。
+测试使用本机模拟服务和临时配置，无需 OpenAI 凭据。Windows 脚本测试模拟计划任务及网络操作；CI 覆盖 Windows Python 3.11／3.13、Ubuntu Python 3.11，以及格式、构建和安装后的命令入口。
 
-`pyproject.toml` 提供标准 Python 包元数据和 `codex-transient-retry` 命令入口。安装 Python 包后可手动运行 `codex-transient-retry --serve`；Windows 自动启停请保留源码目录，并使用该目录中的 PowerShell 脚本。
+Python 包提供 `codex-transient-retry` 命令。安装后可用 `codex-transient-retry --serve` 手动运行；Windows 自动启停仍使用源码目录中的 PowerShell 脚本，手动部署步骤见 [Windows 部署文档](docs/windows.md#手动运行及配置)。
 
-## 项目结构
+## 相关文档
 
-```text
-retry_proxy.py               代理、错误识别、重试及配置管理
-Enable.ps1 / Disable.ps1     Windows 计划任务与启停
-pyproject.toml              Python 包元数据和命令入口
-tests/                      本地回归测试与隔离的 Windows 脚本探针
-docs/architecture.md        协议、缓冲、安全范围及已知限制
-docs/windows.md             部署、迁移、回滚与排查
-docs/validation.md          已验证版本与验证边界
-```
+根据需要查看以下文档：
 
-## 运行数据与边界
+| 文档 | 内容 |
+| --- | --- |
+| [实现原理](docs/architecture.md) | 响应缓冲、错误识别、重试预算及安全范围 |
+| [Windows 部署与迁移](docs/windows.md) | 首次部署、旧目录迁移、手动运行、回滚和排查 |
+| [验证与兼容性基线](docs/validation.md) | 已验证版本、验证方式及未验证范围 |
+| [更新记录](CHANGELOG.md) | 项目版本变更 |
 
-默认配置目录为 `%USERPROFILE%\.codex`，也可通过 `CODEX_HOME` 指定。运行日志和配置状态保存在其 `transient-retry` 子目录；日志最多保留 3 个约 2 MiB 的文件。日志不记录凭据、提示词或回复正文；配置备份可能包含用户自己的敏感设置，应保留在本机。
+## 许可证
 
-本项目只监听本机回环地址，单次请求及响应限制为 64 MiB，使用固定上游并拒绝跟随重定向。它依赖 Codex 当前使用的后端协议及 HTTP 回退行为，升级客户端后需要重新验证。持续故障仍可能耗尽重试；3 秒和 300 秒均为连接／读取空闲超时，900 秒是重试调度预算，均不构成严格的整次请求墙钟上限。
-
-支持范围限于上表列出的路由；调用其他后端路由的客户端功能需要另行兼容。仓库不包含登录状态、用户配置、配置备份、运行日志或代理规则文件。使用许可见 [MIT License](LICENSE)。
+本项目采用 [MIT 许可证](LICENSE)。

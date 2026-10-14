@@ -1,0 +1,31 @@
+# 验证与兼容性基线
+
+发布前执行本地回归、静态检查、源码与 wheel 构建，以及安装后的命令入口验证。
+
+## 已验证环境
+
+| 项目 | 基线 |
+|---|---|
+| 本地 Python | 3.11.9 |
+| Codex CLI／app-server | `0.162.0-alpha.17.2` |
+| Windows Codex 桌面包 | `26.1007.2314.0` |
+| 服务修订 | 5 |
+
+本地测试覆盖容量不足和服务端失败、压缩请求、断流、不可重试错误、`Retry-After`、取消、gzip 损坏和截断、JSON 截断、非法 UTF-8、SSE BOM／换行、304、完整缓冲、凭据及账户隔离的模型缓存、缺失配置、保留内置 provider、旧配置升级及回滚。
+
+Windows 脚本测试在单独的 PowerShell 进程中模拟 Codex 校验、计划任务和网络操作，配置管理只在临时目录执行。测试确认跨目录卸载和手动网关的安装保护，并覆盖首次启用、重复启用、升级和并发编辑时的校验失败处理；不会操作真实计划任务。
+
+## 原生连接验证与 CI
+
+原生 Codex 的内置连接通过本机故障注入验证：4 次尝试、3 次代理重试、1 次 WebSocket 到 HTTP 回退，客户端没有再叠加重试。该检查是单独的本机兼容性验收，普通测试和 CI 不需要安装 Codex 或提供登录凭据。
+
+CI 配置 Windows Python 3.11／3.13 和 Ubuntu Python 3.11 测试矩阵，另检查 Ruff、源码／wheel 构建，以及离开源码目录后安装的命令入口。Actions 固定到已核对的提交 SHA，并只申请仓库内容读取权限。
+
+## 本地复现
+
+```powershell
+python -B -m unittest discover -s tests -v
+python retry_proxy.py --help
+```
+
+本地测试不需要 OpenAI 登录或 API 凭据。模型及压缩的真实服务行为、后续 Codex 版本、不同 Windows 版本和长期负载仍需相应环境验证。

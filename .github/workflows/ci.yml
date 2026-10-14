@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.11"
+    env:
+      NO_PROXY: localhost,127.0.0.1,::1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -B -m unittest discover -s tests -v
+
+  package:
+    name: Lint and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m build
+      - name: Test installed command outside the source tree
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/package-smoke"
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --no-deps --no-index dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/package-smoke/bin/codex-transient-retry" --help

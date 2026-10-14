@@ -27,11 +27,12 @@ from pathlib import Path
 UPSTREAM = "https://chatgpt.com/backend-api/codex"
 PREFIX = "/backend-api/codex"
 PORT = 18761
-PROXY_VERSION = 5
+PROXY_VERSION = 6
 DELAYS = (30, 60, 120)
 MODEL_CATALOG_TIMEOUT = 3
 MAX_BODY = 64 * 1024 * 1024
 DEADLINE_SECONDS = 900
+UPSTREAM_RETRY_BUFFER_MESSAGE = "exceeded request buffer limit while retrying upstream"
 HOP_HEADERS = {
     "host",
     "connection",
@@ -108,7 +109,7 @@ def log_event(event, **fields):
     LOGGER.info(json.dumps({"event": event, **fields}, ensure_ascii=True))
 
 
-def error_reason(error):
+def error_reason(error, status=None):
     if not isinstance(error, dict):
         return None
     code = str(error.get("code", "")).lower()
@@ -117,6 +118,8 @@ def error_reason(error):
         return None
     if code in RETRY_CODES:
         return code
+    if status == 507 and UPSTREAM_RETRY_BUFFER_MESSAGE in message:
+        return "upstream_retry_buffer_limit"
     if "selected model is at capacity" in message:
         return "model_capacity"
     if "an error occurred while processing your request" in message:
@@ -171,12 +174,12 @@ def retry_reason(status, headers, body):
             kind = event.get("type", event_name)
             event_name = ""
             if kind == "error":
-                return error_reason(event.get("error", event))
+                return error_reason(event.get("error", event), status)
             if kind == "response.failed":
                 response = event.get("response", {})
                 if not isinstance(response, dict):
                     return "stream_disconnected"
-                return error_reason(response.get("error", {}))
+                return error_reason(response.get("error", {}), status)
             if kind == "response.incomplete":
                 return None
             if kind == "response.completed":
@@ -194,9 +197,11 @@ def retry_reason(status, headers, body):
         error = data["error"]
         if str(error.get("code", "")).lower() in BLOCK_CODES:
             return None
-        reason = error_reason(error)
+        reason = error_reason(error, status)
         if reason:
             return reason
+    if status == 507 and UPSTREAM_RETRY_BUFFER_MESSAGE in text.lower():
+        return "upstream_retry_buffer_limit"
     if status in (429, 500, 502, 503, 504):
         return "upstream_" + str(status)
     return None

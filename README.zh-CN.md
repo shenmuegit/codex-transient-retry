@@ -77,7 +77,7 @@ Invoke-RestMethod 'http://127.0.0.1:18761/health'
 Get-ScheduledTask -TaskName 'CodexTransientRetry'
 ```
 
-健康检查应返回 `service: codex-transient-retry` 和 `version: 5`。这里的 `version` 是服务修订号，项目发行版本为 `0.5.0`。确认后重新打开 Codex，使新连接使用本地代理。
+健康检查应返回 `service: codex-transient-retry` 和 `version: 6`。这里的 `version` 是服务修订号，项目发行版本为 `0.5.1`。确认后重新打开 Codex，使新连接使用本地代理。
 
 ## 停止并回滚
 
@@ -115,6 +115,8 @@ flowchart TD
 ## 重试策略与支持路由
 
 模型与压缩请求使用以下默认策略，有效的 `Retry-After` 可以延长等待：
+
+HTTP 507 的响应正文命中 `exceeded request buffer limit while retrying upstream`（忽略大小写）时也可重试。明确不可重试的错误码仍优先处理，不会仅凭 507 状态码触发重试。
 
 | 项目 | 行为 |
 | --- | --- |

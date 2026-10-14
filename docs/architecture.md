@@ -41,6 +41,7 @@ SSE 解析识别 `error`、`response.failed`、`response.incomplete`、`response
 |---|---|
 | SSE／JSON 中可识别的模型容量不足、服务过载、临时服务错误 | 对推理或压缩 POST 重试 |
 | 429、500、502、503、504 | 没有明确的不可重试错误码时重试 |
+| 507 | 正文命中 `exceeded request buffer limit while retrying upstream`（忽略大小写）且没有明确不可重试错误码时重试；不按状态码一概重试 |
 | 连接错误、读取中断、SSE 缺少结束事件 | 重试 |
 | 400 | 仅明确识别的可重试错误会重试，其余直接返回 |
 | 401、403、404、413、422 | 直接返回 |

@@ -77,7 +77,7 @@ Invoke-RestMethod 'http://127.0.0.1:18761/health'
 Get-ScheduledTask -TaskName 'CodexTransientRetry'
 ```
 
-The health response should include `service: codex-transient-retry` and `version: 5`. This `version` is the service revision; the Python project version is `0.5.0`. Reopen Codex after these checks so new connections use the local proxy.
+The health response should include `service: codex-transient-retry` and `version: 6`. This `version` is the service revision; the Python project version is `0.5.1`. Reopen Codex after these checks so new connections use the local proxy.
 
 ## Stop and roll back
 
@@ -115,6 +115,8 @@ Buffering applies to one model request at a time. Partial text and local tool ca
 ## Retry policy and supported routes
 
 Model and compaction requests use these defaults. A valid `Retry-After` can extend the wait:
+
+HTTP 507 also qualifies when the response body contains `exceeded request buffer limit while retrying upstream` (case-insensitive). Explicit non-retryable error codes still take precedence; status 507 alone does not trigger a retry.
 
 | Setting | Behavior |
 | --- | --- |

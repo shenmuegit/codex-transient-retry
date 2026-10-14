@@ -102,6 +102,175 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(fetch.call_count, 4)
             self.assertEqual([c.args[0] for c in sleep.call_args_list], [30, 60, 120])
 
+    def test_upstream_retry_buffer_507_recovers_for_model_and_compaction(self):
+        proxy = self.load_proxy()
+        message = "exceeded request buffer limit while retrying upstream"
+        success = {
+            "/responses": ("text/event-stream", b'data: {"type":"response.completed"}\n\n'),
+            "/responses/compact": ("application/json", b'{"output":[]}'),
+        }
+        requests = {path: [] for path in success}
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests[self.path].append(
+                    (
+                        self.headers.get("Authorization"),
+                        self.rfile.read(int(self.headers["Content-Length"])),
+                    )
+                )
+                if len(requests[self.path]) == 1:
+                    status = 507
+                    content_type = "text/plain"
+                    body = message.encode()
+                    if self.path.endswith("/compact"):
+                        content_type = "application/json"
+                        body = json.dumps({"error": {"message": message.upper()}}).encode()
+                else:
+                    status = 200
+                    content_type, body = success[self.path]
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            for path in success:
+                with (
+                    self.subTest(path=path),
+                    patch.object(proxy, "UPSTREAM", f"http://127.0.0.1:{server.server_port}"),
+                    patch.object(proxy.time, "sleep") as sleep,
+                    patch.object(proxy, "log_event"),
+                ):
+                    result = proxy.request_with_retry(
+                        "POST", path, b"{}", {"Authorization": "Bearer test-only"}
+                    )
+                    self.assertEqual(result[0], 200)
+                    self.assertEqual(result[2], success[path][1])
+                    self.assertEqual(requests[path], [("Bearer test-only", b"{}")] * 2)
+                    sleep.assert_called_once_with(30)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_upstream_retry_buffer_507_sse_errors_recover(self):
+        proxy = self.load_proxy()
+        message = "exceeded request buffer limit while retrying upstream"
+        events = [
+            {"type": "error", "error": {"message": message}},
+            {"type": "response.failed", "response": {"error": {"message": message.upper()}}},
+        ]
+        success = (
+            200,
+            {"Content-Type": "text/event-stream"},
+            b'data: {"type":"response.completed"}\n\n',
+        )
+        for event in events:
+            for status in (507, 200):
+                failure = (
+                    status,
+                    {"Content-Type": "text/event-stream"},
+                    ("data: " + json.dumps(event) + "\n\n").encode(),
+                )
+                with (
+                    self.subTest(event=event["type"], status=status),
+                    patch.object(proxy, "fetch", side_effect=[failure, success]) as fetch,
+                    patch.object(proxy.time, "sleep") as sleep,
+                    patch.object(proxy, "log_event"),
+                ):
+                    result = proxy.request_with_retry("POST", "/responses", b"{}", {})
+                    if status == 507:
+                        self.assertEqual(result, success)
+                        self.assertEqual(fetch.call_count, 2)
+                        sleep.assert_called_once_with(30)
+                    else:
+                        self.assertEqual(result, failure)
+                        self.assertEqual(fetch.call_count, 1)
+                        sleep.assert_not_called()
+
+    def test_upstream_retry_buffer_507_uses_existing_limit_and_delays(self):
+        proxy = self.load_proxy()
+        failure = (
+            507,
+            {"X-Request-ID": "test-only-request"},
+            b"exceeded request buffer limit while retrying upstream",
+        )
+        with (
+            patch.object(proxy, "fetch", return_value=failure) as fetch,
+            patch.object(proxy.time, "sleep") as sleep,
+            patch.object(proxy, "log_event"),
+        ):
+            result = proxy.request_with_retry("POST", "/responses", b"{}", {})
+        self.assertEqual(fetch.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60, 120])
+        self.assertEqual(result[0], 400)
+        self.assertEqual(result[1]["X-Request-ID"], "test-only-request")
+        error = json.loads(result[2])
+        self.assertEqual(error["error"]["code"], "local_retry_limit_exceeded")
+        self.assertEqual(error["attempts"], 4)
+        self.assertEqual(error["upstream_status"], 507)
+        self.assertIn("upstream_retry_buffer_limit", error["error"]["message"])
+
+    def test_upstream_retry_buffer_rule_preserves_non_retryable_results(self):
+        proxy = self.load_proxy()
+        message = "exceeded request buffer limit while retrying upstream"
+        cases = [
+            ("POST", "/responses", (507, {}, b"Insufficient Storage")),
+            ("POST", "/responses", (507, {}, b"Local retry buffer limit exceeded")),
+            ("POST", "/responses", (400, {}, message.encode())),
+            ("POST", "/responses", (401, {}, message.encode())),
+            (
+                "POST",
+                "/responses",
+                (
+                    507,
+                    {},
+                    json.dumps(
+                        {"error": {"code": "insufficient_quota", "message": message}}
+                    ).encode(),
+                ),
+            ),
+            ("POST", "/responses", (200, {}, json.dumps({"output": [{"text": message}]}).encode())),
+            ("GET", "/models", (507, {}, message.encode())),
+        ]
+        for event in (
+            {"type": "error", "error": {"code": "insufficient_quota", "message": message}},
+            {
+                "type": "response.failed",
+                "response": {"error": {"code": "insufficient_quota", "message": message}},
+            },
+        ):
+            cases.append(
+                (
+                    "POST",
+                    "/responses",
+                    (
+                        507,
+                        {"Content-Type": "text/event-stream"},
+                        ("data: " + json.dumps(event) + "\n\n").encode(),
+                    ),
+                )
+            )
+        for method, path, failure in cases:
+            with (
+                self.subTest(method=method, status=failure[0], body=failure[2]),
+                patch.object(proxy, "fetch", return_value=failure) as fetch,
+                patch.object(proxy.time, "sleep") as sleep,
+                patch.object(proxy, "log_event"),
+            ):
+                result = proxy.request_with_retry(
+                    method, path, b"{}" if method == "POST" else None, {}
+                )
+                self.assertEqual(result, failure)
+                self.assertEqual(fetch.call_count, 1)
+                sleep.assert_not_called()
+
     def test_auth_quota_and_token_limits_do_not_retry(self):
         proxy = self.load_proxy()
         cases = [

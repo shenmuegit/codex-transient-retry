@@ -31,6 +31,7 @@
 - 对可识别的模型容量不足、服务过载和断流自动重试，覆盖模型回复与远程上下文压缩
 - 完整缓冲单次响应，丢弃失败尝试中的部分输出，避免提前执行其中的本机工具调用
 - 使用 Windows 计划任务在登录时启动，备份配置并支持关闭与回滚
+- 转发内置生图和改图请求，不增加本地自动重试
 
 持续故障仍可能耗尽重试。身份验证失败、额度不足、上下文超限和无效请求等明确错误直接返回；其他后端路由及登录方式不在当前验收范围内。
 
@@ -77,7 +78,7 @@ Invoke-RestMethod 'http://127.0.0.1:18761/health'
 Get-ScheduledTask -TaskName 'CodexTransientRetry'
 ```
 
-健康检查应返回 `service: codex-transient-retry` 和 `version: 6`。这里的 `version` 是服务修订号，项目发行版本为 `0.5.1`。确认后重新打开 Codex，使新连接使用本地代理。
+健康检查应返回 `service: codex-transient-retry` 和 `version: 7`。这里的 `version` 是服务修订号，项目发行版本为 `0.5.2`。确认后重新打开 Codex，使新连接使用本地代理。
 
 ## 停止并回滚
 
@@ -132,10 +133,14 @@ HTTP 507 的响应正文命中 `exceeded request buffer limit while retrying ups
 | --- | --- |
 | `POST /backend-api/codex/responses` | 缓冲模型响应并重试短暂故障 |
 | `POST /backend-api/codex/responses/compact` | 缓冲远程上下文压缩响应并重试短暂故障 |
+| `POST /backend-api/codex/images/generations` | 向固定上游单次转发，不增加本地重试 |
+| `POST /backend-api/codex/images/edits` | 向固定上游单次转发，不增加本地重试 |
 | `GET /backend-api/codex/models` | 单次转发；有效列表按凭据及账户隔离缓存 5 分钟，连接与读取空闲超时 3 秒 |
 | `GET /health` | 返回服务修订号、进程和重试参数 |
 
 推理请求的连接与读取空闲超时最多为 300 秒，重试调度预算为 900 秒。缓慢但持续传输的响应可能超出这些时间，**900 秒不是整次请求的硬性时长上限**。
+
+图片请求保留原始正文与鉴权头，使用 300 秒连接／读取空闲超时，单次转发并返回上游状态与正文。模型重试规则（包括定向 507 规则）不作用于图片请求，避免增加重复生成尝试。
 
 代理只监听本机回环地址，单次请求和响应分别限制为 64 MiB，并拒绝跟随上游重定向。它不转发 WebSocket，也没有全局并发或总内存配额；Codex 升级后需要重新验证兼容性。
 

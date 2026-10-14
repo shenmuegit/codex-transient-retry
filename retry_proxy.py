@@ -27,7 +27,7 @@ from pathlib import Path
 UPSTREAM = "https://chatgpt.com/backend-api/codex"
 PREFIX = "/backend-api/codex"
 PORT = 18761
-PROXY_VERSION = 6
+PROXY_VERSION = 7
 DELAYS = (30, 60, 120)
 MODEL_CATALOG_TIMEOUT = 3
 MAX_BODY = 64 * 1024 * 1024
@@ -422,12 +422,18 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", PREFIX + "/responses"),
                 ("POST", PREFIX + "/responses/compact"),
             }
+            image_request = self.command == "POST" and parsed.path in {
+                PREFIX + "/images/generations",
+                PREFIX + "/images/edits",
+            }
             websocket = (
                 self.command == "GET"
                 and parsed.path == PREFIX + "/responses"
                 and self.headers.get("Upgrade", "").lower() == "websocket"
             )
-            if ((self.command, parsed.path) not in routes and not websocket) or parsed.netloc:
+            if (
+                (self.command, parsed.path) not in routes and not websocket and not image_request
+            ) or parsed.netloc:
                 return self.reply(404, {}, b"Unknown route")
             if self.headers.get("Origin") or not self.headers.get("Authorization", "").startswith(
                 "Bearer "
@@ -452,9 +458,12 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) != length:
                 return
             path = parsed.path[len(PREFIX) :] + ("?" + parsed.query if parsed.query else "")
-            result = request_with_retry(
-                self.command, path, body, dict(self.headers.items()), self.cancelled, self.pause
-            )
+            if image_request:
+                result = fetch(self.command, path, body, dict(self.headers.items()), 300)
+            else:
+                result = request_with_retry(
+                    self.command, path, body, dict(self.headers.items()), self.cancelled, self.pause
+                )
             self.reply(*result)
         except (ClientDisconnected, BrokenPipeError, ConnectionResetError, TimeoutError):
             log_event("client_disconnected")

@@ -7,7 +7,7 @@ function Get-ScheduledTask {
     [CmdletBinding()] param([string]$TaskName)
     [PSCustomObject]@{Actions = [PSCustomObject]@{Execute = $global:retryTestPythonw; Arguments = $global:retryTestArguments}}
 }
-function Invoke-RestMethod { [PSCustomObject]@{service = 'codex-transient-retry'; version = 6} }
+function Invoke-RestMethod { [PSCustomObject]@{service = 'codex-transient-retry'; version = 7} }
 function New-ScheduledTaskAction { [PSCustomObject]@{} }
 function New-ScheduledTaskTrigger { [PSCustomObject]@{} }
 function New-ScheduledTaskPrincipal { [PSCustomObject]@{} }

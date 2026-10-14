@@ -31,6 +31,7 @@ This helper is intended for personal use on one machine:
 - Retry recognized model capacity errors, server overload, and interrupted responses for inference and remote compaction
 - Buffer each response and discard failed attempts before delivering partial output or local tool calls
 - Start at Windows sign-in through a scheduled task, with configuration backups and rollback support
+- Forward built-in image generation and editing requests without adding local retries
 
 Persistent failures can still exhaust the retry budget. Explicit authentication, quota, context-length, and invalid-request errors return immediately. Other backend routes and sign-in methods are outside the current validation scope.
 
@@ -77,7 +78,7 @@ Invoke-RestMethod 'http://127.0.0.1:18761/health'
 Get-ScheduledTask -TaskName 'CodexTransientRetry'
 ```
 
-The health response should include `service: codex-transient-retry` and `version: 6`. This `version` is the service revision; the Python project version is `0.5.1`. Reopen Codex after these checks so new connections use the local proxy.
+The health response should include `service: codex-transient-retry` and `version: 7`. This `version` is the service revision; the Python project version is `0.5.2`. Reopen Codex after these checks so new connections use the local proxy.
 
 ## Stop and roll back
 
@@ -132,10 +133,14 @@ The proxy supports these routes. Model catalog requests have a separate, shorter
 | --- | --- |
 | `POST /backend-api/codex/responses` | Buffer model responses and retry temporary failures |
 | `POST /backend-api/codex/responses/compact` | Buffer remote compaction responses and retry temporary failures |
+| `POST /backend-api/codex/images/generations` | Forward once to the fixed upstream, without local retries |
+| `POST /backend-api/codex/images/edits` | Forward once to the fixed upstream, without local retries |
 | `GET /backend-api/codex/models` | Forward once; cache a valid catalog for 5 minutes per matching credential and account, with a 3-second connection/read idle timeout |
 | `GET /health` | Return the service revision, process information, and retry parameters |
 
 Inference connection/read idle timeouts are at most 300 seconds, and the retry scheduling budget is 900 seconds. A slowly but continuously transmitting response can exceed these values. **The 900-second budget is not a hard limit on total request duration.**
+
+Image requests keep their original payload and authentication headers. The local proxy forwards each request once, with a 300-second connection/read idle timeout, and returns the upstream status and body. Model retry rules, including the matching 507 rule, do not apply to image calls; this avoids adding duplicate generation attempts.
 
 The proxy listens only on loopback, limits each request and response to 64 MiB, and refuses upstream redirects. It does not forward WebSocket connections or impose global concurrency or memory quotas. Revalidate compatibility after upgrading Codex.
 

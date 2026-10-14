@@ -21,7 +21,7 @@ try {
     if ($retryHealth.service -ne 'codex-transient-retry') {
         throw 'Port 18761 is already used by another service.'
     }
-    $retryNeedsRestart = $retryHealth.version -ne 6
+    $retryNeedsRestart = $retryHealth.version -ne 7
 } catch {
     $retryListener = Get-NetTCPConnection -LocalPort 18761 -State Listen -ErrorAction SilentlyContinue
     if ($retryListener) {
@@ -53,7 +53,7 @@ $retryReady = $false
 for ($retryCheck = 0; $retryCheck -lt 40; $retryCheck++) {
     try {
         $retryHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:18761/health' -TimeoutSec 1
-        if (($retryHealth.service -eq 'codex-transient-retry') -and ($retryHealth.version -eq 6)) {
+        if (($retryHealth.service -eq 'codex-transient-retry') -and ($retryHealth.version -eq 7)) {
             $retryReady = $true
             break
         }

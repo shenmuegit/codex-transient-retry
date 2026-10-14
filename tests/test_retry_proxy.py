@@ -1,4 +1,5 @@
 import gzip
+import http.client
 import importlib.util
 import json
 import tempfile
@@ -853,6 +854,132 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(Path(setup["backup"]).read_text(), original)
             proxy.configure(config, False)
             self.assertEqual(config.read_text(), original)
+
+    def test_image_routes_forward_once_without_model_retries(self):
+        proxy = self.load_proxy()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        results = [
+            (
+                200,
+                {"Content-Type": "application/json", "X-Codex-Imagegen-Request-Id": "test-image"},
+                b'{"data":[{"b64_json":"test-only"}]}',
+            ),
+            (
+                507,
+                {"Content-Type": "text/plain"},
+                b"exceeded request buffer limit while retrying upstream",
+            ),
+        ]
+        try:
+            for path in ("/images/generations", "/images/edits"):
+                for result in results:
+                    payload = b'{"prompt":"test-only"}'
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/backend-api/codex{path}?test=1",
+                        data=payload,
+                        headers={
+                            "Authorization": "Bearer test-only",
+                            "ChatGPT-Account-ID": "test-account",
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    with (
+                        self.subTest(path=path, status=result[0]),
+                        patch.object(proxy, "fetch", return_value=result) as fetch,
+                        patch.object(
+                            proxy,
+                            "request_with_retry",
+                            side_effect=AssertionError("Image calls must not use model retries"),
+                        ),
+                        patch.object(proxy, "log_event"),
+                    ):
+                        try:
+                            response = opener.open(request, timeout=2)
+                        except urllib.error.HTTPError as error:
+                            response = error
+                        with response:
+                            self.assertEqual(response.status, result[0])
+                            self.assertEqual(response.read(), result[2])
+                            if result[0] == 200:
+                                self.assertEqual(
+                                    response.headers["X-Codex-Imagegen-Request-Id"], "test-image"
+                                )
+                        fetch.assert_called_once()
+                        method, forwarded_path, body, headers, timeout = fetch.call_args.args
+                        self.assertEqual(
+                            (method, forwarded_path, body, timeout),
+                            ("POST", path + "?test=1", payload, 300),
+                        )
+                        forwarded = {key.lower(): value for key, value in headers.items()}
+                        self.assertEqual(forwarded["authorization"], "Bearer test-only")
+                        self.assertEqual(forwarded["chatgpt-account-id"], "test-account")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_image_routes_preserve_auth_origin_and_size_guards(self):
+        proxy = self.load_proxy()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        cases = [
+            ("POST", {}, 401),
+            (
+                "POST",
+                {"Authorization": "Bearer test-only", "Origin": "https://example.invalid"},
+                401,
+            ),
+            (
+                "POST",
+                {"Authorization": "Bearer test-only", "Content-Length": str(proxy.MAX_BODY + 1)},
+                413,
+            ),
+            ("GET", {"Authorization": "Bearer test-only"}, 404),
+        ]
+        try:
+            for path in ("/images/generations", "/images/edits"):
+                for method, headers, expected in cases:
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/backend-api/codex{path}",
+                        data=b"{}" if method == "POST" else None,
+                        headers=headers,
+                        method=method,
+                    )
+                    with (
+                        self.subTest(path=path, method=method, expected=expected),
+                        patch.object(proxy, "fetch") as fetch,
+                        self.assertRaises(urllib.error.HTTPError) as error,
+                    ):
+                        opener.open(request, timeout=2)
+                    self.assertEqual(error.exception.code, expected)
+                    fetch.assert_not_called()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_image_routes_reject_absolute_request_targets(self):
+        proxy = self.load_proxy()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            with patch.object(proxy, "fetch") as fetch:
+                connection.request(
+                    "POST",
+                    "http://example.invalid/backend-api/codex/images/generations",
+                    body=b"{}",
+                    headers={"Authorization": "Bearer test-only"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 404)
+                response.read()
+                fetch.assert_not_called()
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
 
     def test_local_routes_reject_unknown_paths_and_missing_credentials(self):
         proxy = self.load_proxy()

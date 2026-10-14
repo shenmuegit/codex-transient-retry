@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+
+- Forward built-in image generation and editing routes to the fixed Codex upstream, resolving local `404 / Unknown route` errors.
+- Keep image calls single-attempt while preserving authentication, payloads, size limits, browser-origin rejection, and redirect protection.
+- Advance the service revision to 7; model and compaction retry policies remain unchanged.
+
 ## 0.5.1
 
 - Retry HTTP 507 responses containing `exceeded request buffer limit while retrying upstream`, using the existing attempt limit and backoff.

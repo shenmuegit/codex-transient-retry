@@ -14,7 +14,7 @@ Get-ScheduledTask -TaskName 'CodexTransientRetry'
 
 脚本注册当前用户的登录触发任务，使用 `pythonw.exe` 启动当前目录中的 `retry_proxy.py --serve`，检查健康端点后才修改 Codex 配置。最后完全退出并重新打开 Codex。
 
-不要在任务仍引用该目录时删除或移动目录。健康端点中的 `version: 6` 是服务修订号；Python 项目发行版本为 `0.5.1`。
+不要在任务仍引用该目录时删除或移动目录。健康端点中的 `version: 7` 是服务修订号；Python 项目发行版本为 `0.5.2`。
 
 ## 从旧目录迁移
 

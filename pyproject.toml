@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-transient-retry"
-version = "0.5.2"
-description = "Local buffered retries for transient Codex inference and compaction failures"
+version = "0.6.0"
+description = "Local buffered retries for all requests sent to the Codex gateway"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

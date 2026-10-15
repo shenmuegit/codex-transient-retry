@@ -24,10 +24,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-UPSTREAM = "https://chatgpt.com/backend-api/codex"
+UPSTREAM = "https://chatgpt.com"
 PREFIX = "/backend-api/codex"
 PORT = 18761
-PROXY_VERSION = 7
+PROXY_VERSION = 8
 DELAYS = (30, 60, 120)
 MODEL_CATALOG_TIMEOUT = 3
 MAX_BODY = 64 * 1024 * 1024
@@ -124,12 +124,15 @@ def error_reason(error, status=None):
         return "model_capacity"
     if "an error occurred while processing your request" in message:
         return "server_error"
-    return None
+    return "upstream_" + str(status) if status in (429, 500, 502, 503, 504) else None
 
 
-def retry_reason(status, headers, body):
+def retry_reason(status, headers, body, validate_response=True):
     headers = {k.lower(): v for k, v in headers.items()}
+    json_response = "json" in headers.get("content-type", "").lower()
     if status in (401, 403, 404, 413, 422):
+        return None
+    if status == 200 and not validate_response and not body:
         return None
     if headers.get("content-encoding", "").lower() == "gzip":
         try:
@@ -142,9 +145,16 @@ def retry_reason(status, headers, body):
     try:
         text = body.decode("utf-8-sig")
     except UnicodeDecodeError:
-        if status == 200:
+        if status == 200 and (validate_response or json_response):
             return "stream_disconnected"
         text = ""
+    fallback_reason = (
+        "upstream_retry_buffer_limit"
+        if status == 507 and UPSTREAM_RETRY_BUFFER_MESSAGE in text.lower()
+        else "upstream_" + str(status)
+        if status in (429, 500, 502, 503, 504)
+        else None
+    )
     if "text/event-stream" in headers.get("content-type", "").lower() or text.lstrip(
         "\ufeff \t\r\n"
     ).startswith(("data:", "event:", ":")):
@@ -168,30 +178,36 @@ def retry_reason(status, headers, body):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:
-                return "stream_disconnected"
+                if validate_response:
+                    return "stream_disconnected"
+                continue
             if not isinstance(event, dict):
-                return "stream_disconnected"
+                if validate_response:
+                    return "stream_disconnected"
+                continue
             kind = event.get("type", event_name)
             event_name = ""
             if kind == "error":
-                return error_reason(event.get("error", event), status)
+                error = event.get("error", event)
+                return error_reason(error, status) if isinstance(error, dict) else fallback_reason
             if kind == "response.failed":
                 response = event.get("response", {})
                 if not isinstance(response, dict):
-                    return "stream_disconnected"
-                return error_reason(response.get("error", {}), status)
+                    return "stream_disconnected" if validate_response else fallback_reason
+                error = response.get("error", {})
+                return error_reason(error, status) if isinstance(error, dict) else fallback_reason
             if kind == "response.incomplete":
-                return None
+                return None if validate_response else fallback_reason
             if kind == "response.completed":
                 completed = True
-        return None if completed else "stream_disconnected"
+        return fallback_reason if completed or not validate_response else "stream_disconnected"
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        if status == 200:
+        if status == 200 and (validate_response or json_response):
             return "stream_disconnected"
         data = {}
-    if status == 200 and not isinstance(data, dict):
+    if status == 200 and validate_response and not isinstance(data, dict):
         return "stream_disconnected"
     if isinstance(data, dict) and isinstance(data.get("error"), dict):
         error = data["error"]
@@ -200,18 +216,14 @@ def retry_reason(status, headers, body):
         reason = error_reason(error, status)
         if reason:
             return reason
-    if status == 507 and UPSTREAM_RETRY_BUFFER_MESSAGE in text.lower():
-        return "upstream_retry_buffer_limit"
-    if status in (429, 500, 502, 503, 504):
-        return "upstream_" + str(status)
-    return None
+    return fallback_reason
 
 
 def fetch(method, path, body, headers, timeout):
     forwarded = {k: v for k, v in headers.items() if k.lower() not in HOP_HEADERS}
     forwarded["Accept-Encoding"] = "gzip"
     request = urllib.request.Request(
-        UPSTREAM + path, data=body if method == "POST" else None, headers=forwarded, method=method
+        UPSTREAM + path, data=body if body else None, headers=forwarded, method=method
     )
     try:
         response = OPENER.open(request, timeout=timeout)
@@ -232,7 +244,7 @@ def fetch(method, path, body, headers, timeout):
             )
         data = response.read(MAX_BODY + 1)
         response_headers = dict(response.headers.items())
-        if response.headers.get("Content-Encoding", "").lower() == "gzip":
+        if method != "HEAD" and response.headers.get("Content-Encoding", "").lower() == "gzip":
             if data:
                 with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
                     data = compressed.read(MAX_BODY + 1)
@@ -270,7 +282,8 @@ def request_with_retry(method, path, body, headers, cancelled=None, pause=None):
     cancelled = cancelled or (lambda: False)
     pause = pause or time.sleep
     catalog_key = None
-    if method == "GET" and path.split("?", 1)[0] == "/models":
+    request_path = path.split("?", 1)[0]
+    if method == "GET" and request_path == PREFIX + "/models":
         authorization = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
         account = next((v for k, v in headers.items() if k.lower() == "chatgpt-account-id"), "")
         catalog_key = (path, authorization, account)
@@ -305,13 +318,22 @@ def request_with_retry(method, path, body, headers, cancelled=None, pause=None):
         if cancelled():
             raise ClientDisconnected()
         status, response_headers, response_body = result
-        reason = retry_reason(status, response_headers, response_body)
+        reason = retry_reason(
+            status,
+            {} if method == "HEAD" else response_headers,
+            response_body,
+            validate_response=method == "POST"
+            and request_path in (PREFIX + "/responses", PREFIX + "/responses/compact"),
+        )
         if catalog_key and status == 200 and not reason:
-            catalog = json.loads(response_body.decode("utf-8-sig"))
-            if isinstance(catalog.get("models"), list):
+            try:
+                catalog = json.loads(response_body.decode("utf-8-sig"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                catalog = None
+            if isinstance(catalog, dict) and isinstance(catalog.get("models"), list):
                 # Catalog refreshes have a short timeout; reuse only a valid matching account catalog.
                 MODEL_CATALOG_CACHE = (catalog_key, time.monotonic() + 300, result)
-        if not reason or method != "POST":
+        if not reason:
             log_event(
                 "finished",
                 path=path.split("?", 1)[0],
@@ -369,10 +391,19 @@ class Handler(BaseHTTPRequestHandler):
         for key, value in headers.items():
             if key.lower() not in HOP_HEADERS | {"server", "date"}:
                 self.send_header(key, value)
-        self.send_header("Content-Length", str(len(body)))
+        length = (
+            next(
+                (value for key, value in headers.items() if key.lower() == "content-length"),
+                str(len(body)),
+            )
+            if self.command == "HEAD"
+            else str(len(body))
+        )
+        self.send_header("Content-Length", length)
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
         self.close_connection = True
 
     def cancelled(self):
@@ -389,11 +420,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ClientDisconnected()
             time.sleep(max(0, min(1, until - time.monotonic())))
 
-    def do_GET(self):
-        self.handle_request()
-
-    def do_POST(self):
-        self.handle_request()
+    def __getattr__(self, name):
+        if name.startswith("do_"):
+            return self.handle_request
+        raise AttributeError(name)
 
     def handle_request(self):
         self.connection.settimeout(30)
@@ -417,23 +447,12 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             parsed = urllib.parse.urlsplit(self.path)
-            routes = {
-                ("GET", PREFIX + "/models"),
-                ("POST", PREFIX + "/responses"),
-                ("POST", PREFIX + "/responses/compact"),
-            }
-            image_request = self.command == "POST" and parsed.path in {
-                PREFIX + "/images/generations",
-                PREFIX + "/images/edits",
-            }
             websocket = (
                 self.command == "GET"
                 and parsed.path == PREFIX + "/responses"
                 and self.headers.get("Upgrade", "").lower() == "websocket"
             )
-            if (
-                (self.command, parsed.path) not in routes and not websocket and not image_request
-            ) or parsed.netloc:
+            if parsed.scheme or parsed.netloc or parsed.fragment or not parsed.path.startswith("/"):
                 return self.reply(404, {}, b"Unknown route")
             if self.headers.get("Origin") or not self.headers.get("Authorization", "").startswith(
                 "Bearer "
@@ -457,13 +476,14 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             if len(body) != length:
                 return
-            path = parsed.path[len(PREFIX) :] + ("?" + parsed.query if parsed.query else "")
-            if image_request:
-                result = fetch(self.command, path, body, dict(self.headers.items()), 300)
-            else:
-                result = request_with_retry(
-                    self.command, path, body, dict(self.headers.items()), self.cancelled, self.pause
-                )
+            result = request_with_retry(
+                self.command,
+                self.path,
+                body,
+                dict(self.headers.items()),
+                self.cancelled,
+                self.pause,
+            )
             self.reply(*result)
         except (ClientDisconnected, BrokenPipeError, ConnectionResetError, TimeoutError):
             log_event("client_disconnected")

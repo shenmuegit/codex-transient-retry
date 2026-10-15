@@ -21,7 +21,7 @@ try {
     if ($retryHealth.service -ne 'codex-transient-retry') {
         throw 'Port 18761 is already used by another service.'
     }
-    $retryNeedsRestart = $retryHealth.version -ne 7
+    $retryNeedsRestart = $retryHealth.version -ne 8
 } catch {
     $retryListener = Get-NetTCPConnection -LocalPort 18761 -State Listen -ErrorAction SilentlyContinue
     if ($retryListener) {
@@ -46,14 +46,14 @@ $retryAction = New-ScheduledTaskAction -Execute $retryPythonw -Argument $retryAr
 $retryTrigger = New-ScheduledTaskTrigger -AtLogOn -User $retryIdentity
 $retryPrincipal = New-ScheduledTaskPrincipal -UserId $retryIdentity -LogonType Interactive -RunLevel Limited
 $retrySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName $retryTaskName -Action $retryAction -Trigger $retryTrigger -Principal $retryPrincipal -Settings $retrySettings -Description 'Local buffered retries for transient Codex inference and compaction failures.' -Force | Out-Null
+Register-ScheduledTask -TaskName $retryTaskName -Action $retryAction -Trigger $retryTrigger -Principal $retryPrincipal -Settings $retrySettings -Description 'Local buffered retries for all requests sent to the Codex gateway.' -Force | Out-Null
 Start-ScheduledTask -TaskName $retryTaskName
 
 $retryReady = $false
 for ($retryCheck = 0; $retryCheck -lt 40; $retryCheck++) {
     try {
         $retryHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:18761/health' -TimeoutSec 1
-        if (($retryHealth.service -eq 'codex-transient-retry') -and ($retryHealth.version -eq 7)) {
+        if (($retryHealth.service -eq 'codex-transient-retry') -and ($retryHealth.version -eq 8)) {
             $retryReady = $true
             break
         }

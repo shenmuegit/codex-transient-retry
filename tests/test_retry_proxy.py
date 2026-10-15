@@ -62,13 +62,19 @@ class ProxyTests(unittest.TestCase):
                 patch.object(proxy, "log_event"),
             ):
                 result = proxy.request_with_retry(
-                    "POST", "/responses", b'{"stream":true}', {"Authorization": "Bearer test-only"}
+                    "POST",
+                    "/backend-api/codex/responses",
+                    b'{"stream":true}',
+                    {"Authorization": "Bearer test-only"},
                 )
             self.assertEqual(result[2], complete)
             self.assertEqual(len(requests), 3)
             self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60])
             self.assertTrue(
-                all(r == ("/responses", "Bearer test-only", b'{"stream":true}') for r in requests)
+                all(
+                    r == ("/backend-api/codex/responses", "Bearer test-only", b'{"stream":true}')
+                    for r in requests
+                )
             )
         finally:
             server.shutdown()
@@ -88,7 +94,10 @@ class ProxyTests(unittest.TestCase):
             patch.object(proxy, "log_event"),
         ):
             self.assertEqual(
-                proxy.request_with_retry("POST", "/responses/compact", b"{}", {})[0], 200
+                proxy.request_with_retry("POST", "/backend-api/codex/responses/compact", b"{}", {})[
+                    0
+                ],
+                200,
             )
             self.assertEqual(fetch.call_count, 2)
             sleep.assert_called_once_with(30)
@@ -97,7 +106,9 @@ class ProxyTests(unittest.TestCase):
             patch.object(proxy.time, "sleep") as sleep,
             patch.object(proxy, "log_event"),
         ):
-            result = proxy.request_with_retry("POST", "/responses/compact", b"{}", {})
+            result = proxy.request_with_retry(
+                "POST", "/backend-api/codex/responses/compact", b"{}", {}
+            )
             self.assertEqual(result[0], 400)
             self.assertEqual(json.loads(result[2])["error"]["code"], "local_retry_limit_exceeded")
             self.assertEqual(fetch.call_count, 4)
@@ -107,8 +118,11 @@ class ProxyTests(unittest.TestCase):
         proxy = self.load_proxy()
         message = "exceeded request buffer limit while retrying upstream"
         success = {
-            "/responses": ("text/event-stream", b'data: {"type":"response.completed"}\n\n'),
-            "/responses/compact": ("application/json", b'{"output":[]}'),
+            "/backend-api/codex/responses": (
+                "text/event-stream",
+                b'data: {"type":"response.completed"}\n\n',
+            ),
+            "/backend-api/codex/responses/compact": ("application/json", b'{"output":[]}'),
         }
         requests = {path: [] for path in success}
 
@@ -185,7 +199,9 @@ class ProxyTests(unittest.TestCase):
                     patch.object(proxy.time, "sleep") as sleep,
                     patch.object(proxy, "log_event"),
                 ):
-                    result = proxy.request_with_retry("POST", "/responses", b"{}", {})
+                    result = proxy.request_with_retry(
+                        "POST", "/backend-api/codex/responses", b"{}", {}
+                    )
                     if status == 507:
                         self.assertEqual(result, success)
                         self.assertEqual(fetch.call_count, 2)
@@ -207,7 +223,7 @@ class ProxyTests(unittest.TestCase):
             patch.object(proxy.time, "sleep") as sleep,
             patch.object(proxy, "log_event"),
         ):
-            result = proxy.request_with_retry("POST", "/responses", b"{}", {})
+            result = proxy.request_with_retry("POST", "/backend-api/codex/responses", b"{}", {})
         self.assertEqual(fetch.call_count, 4)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60, 120])
         self.assertEqual(result[0], 400)
@@ -222,13 +238,17 @@ class ProxyTests(unittest.TestCase):
         proxy = self.load_proxy()
         message = "exceeded request buffer limit while retrying upstream"
         cases = [
-            ("POST", "/responses", (507, {}, b"Insufficient Storage")),
-            ("POST", "/responses", (507, {}, b"Local retry buffer limit exceeded")),
-            ("POST", "/responses", (400, {}, message.encode())),
-            ("POST", "/responses", (401, {}, message.encode())),
+            ("POST", "/backend-api/codex/responses", (507, {}, b"Insufficient Storage")),
             (
                 "POST",
-                "/responses",
+                "/backend-api/codex/responses",
+                (507, {}, b"Local retry buffer limit exceeded"),
+            ),
+            ("POST", "/backend-api/codex/responses", (400, {}, message.encode())),
+            ("POST", "/backend-api/codex/responses", (401, {}, message.encode())),
+            (
+                "POST",
+                "/backend-api/codex/responses",
                 (
                     507,
                     {},
@@ -237,8 +257,11 @@ class ProxyTests(unittest.TestCase):
                     ).encode(),
                 ),
             ),
-            ("POST", "/responses", (200, {}, json.dumps({"output": [{"text": message}]}).encode())),
-            ("GET", "/models", (507, {}, message.encode())),
+            (
+                "POST",
+                "/backend-api/codex/responses",
+                (200, {}, json.dumps({"output": [{"text": message}]}).encode()),
+            ),
         ]
         for event in (
             {"type": "error", "error": {"code": "insufficient_quota", "message": message}},
@@ -250,7 +273,7 @@ class ProxyTests(unittest.TestCase):
             cases.append(
                 (
                     "POST",
-                    "/responses",
+                    "/backend-api/codex/responses",
                     (
                         507,
                         {"Content-Type": "text/event-stream"},
@@ -296,7 +319,10 @@ class ProxyTests(unittest.TestCase):
                 patch.object(proxy.time, "sleep") as sleep,
                 patch.object(proxy, "log_event"),
             ):
-                self.assertEqual(proxy.request_with_retry("POST", "/responses", b"{}", {}), result)
+                self.assertEqual(
+                    proxy.request_with_retry("POST", "/backend-api/codex/responses", b"{}", {}),
+                    result,
+                )
                 self.assertEqual(fetch.call_count, 1)
                 sleep.assert_not_called()
 
@@ -313,7 +339,7 @@ class ProxyTests(unittest.TestCase):
             patch.object(proxy.time, "sleep"),
             patch.object(proxy, "log_event"),
         ):
-            result = proxy.request_with_retry("POST", "/responses", b"{}", {})
+            result = proxy.request_with_retry("POST", "/backend-api/codex/responses", b"{}", {})
             self.assertEqual(result[0], 400)
             self.assertEqual(fetch.call_count, 4)
 
@@ -349,7 +375,7 @@ class ProxyTests(unittest.TestCase):
                 patch.object(proxy, "log_event"),
             ):
                 result = proxy.request_with_retry(
-                    "POST", "/responses", b"{}", {}, pause=delays.append
+                    "POST", "/backend-api/codex/responses", b"{}", {}, pause=delays.append
                 )
             self.assertEqual(result[2], complete)
             self.assertEqual(len(calls), 3)
@@ -383,7 +409,7 @@ class ProxyTests(unittest.TestCase):
                 patch.object(proxy, "log_event"),
             ):
                 result = proxy.request_with_retry(
-                    "POST", "/responses/compact", b"{}", {}, pause=lambda _: None
+                    "POST", "/backend-api/codex/responses/compact", b"{}", {}, pause=lambda _: None
                 )
             self.assertEqual(result[2], b'{"output":[]}')
             self.assertEqual(len(calls), 2)
@@ -405,7 +431,7 @@ class ProxyTests(unittest.TestCase):
         ):
             self.assertEqual(
                 proxy.request_with_retry(
-                    "POST", "/responses/compact", b"{}", {}, pause=lambda _: None
+                    "POST", "/backend-api/codex/responses/compact", b"{}", {}, pause=lambda _: None
                 ),
                 success,
             )
@@ -418,7 +444,7 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(
                 proxy.request_with_retry(
                     "POST",
-                    "/responses/compact",
+                    "/backend-api/codex/responses/compact",
                     b"{}",
                     {},
                     pause=lambda _: self.fail("Invalid requests must not retry"),
@@ -441,14 +467,16 @@ class ProxyTests(unittest.TestCase):
             patch.object(proxy.time, "sleep") as sleep,
             patch.object(proxy, "log_event"),
         ):
-            proxy.request_with_retry("POST", "/responses/compact", b"{}", {})
+            proxy.request_with_retry("POST", "/backend-api/codex/responses/compact", b"{}", {})
             sleep.assert_called_once_with(45)
 
     def test_cancellation_prevents_new_requests(self):
         proxy = self.load_proxy()
         with patch.object(proxy, "fetch") as fetch:
             with self.assertRaises(proxy.ClientDisconnected):
-                proxy.request_with_retry("POST", "/responses", b"{}", {}, cancelled=lambda: True)
+                proxy.request_with_retry(
+                    "POST", "/backend-api/codex/responses", b"{}", {}, cancelled=lambda: True
+                )
             fetch.assert_not_called()
 
     def test_sse_event_name_without_type_is_recognized(self):
@@ -480,7 +508,7 @@ class ProxyTests(unittest.TestCase):
                     patch.object(proxy, "log_event"),
                 ):
                     result = proxy.request_with_retry(
-                        "POST", "/responses", b"{}", {}, pause=lambda _: None
+                        "POST", "/backend-api/codex/responses", b"{}", {}, pause=lambda _: None
                     )
                     self.assertEqual(result, complete)
                     self.assertEqual(fetch.call_count, 2)
@@ -516,7 +544,9 @@ class ProxyTests(unittest.TestCase):
             ) as fetch,
             patch.object(proxy, "log_event"),
         ):
-            result = proxy.request_with_retry("POST", "/responses", b"{}", {}, pause=lambda _: None)
+            result = proxy.request_with_retry(
+                "POST", "/backend-api/codex/responses", b"{}", {}, pause=lambda _: None
+            )
             self.assertEqual(result[2], complete)
             self.assertEqual(fetch.call_count, 2)
 
@@ -536,7 +566,7 @@ class ProxyTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             with patch.object(proxy, "UPSTREAM", f"http://127.0.0.1:{server.server_port}"):
-                result = proxy.fetch("GET", "/models", None, {}, 2)
+                result = proxy.fetch("GET", "/backend-api/codex/models", None, {}, 2)
             self.assertEqual(result[0], 304)
             self.assertEqual(result[1]["ETag"], '"test-models"')
         finally:
@@ -565,7 +595,7 @@ class ProxyTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             with patch.object(proxy, "UPSTREAM", f"http://127.0.0.1:{server.server_port}"):
-                result = proxy.fetch("GET", "/models", None, {}, 2)
+                result = proxy.fetch("GET", "/backend-api/codex/models", None, {}, 2)
             self.assertEqual(result[2], catalog)
             self.assertNotIn("Content-Encoding", result[1])
             self.assertEqual(server.encoding, "gzip")
@@ -705,10 +735,16 @@ class ProxyTests(unittest.TestCase):
             patch.object(proxy, "fetch", return_value=result) as fetch,
             patch.object(proxy, "log_event"),
         ):
-            proxy.request_with_retry("GET", "/models", None, {"Authorization": "Bearer test-one"})
-            proxy.request_with_retry("GET", "/models", None, {"Authorization": "Bearer test-one"})
+            proxy.request_with_retry(
+                "GET", "/backend-api/codex/models", None, {"Authorization": "Bearer test-one"}
+            )
+            proxy.request_with_retry(
+                "GET", "/backend-api/codex/models", None, {"Authorization": "Bearer test-one"}
+            )
             self.assertEqual(fetch.call_count, 1)
-            proxy.request_with_retry("GET", "/models", None, {"Authorization": "Bearer test-two"})
+            proxy.request_with_retry(
+                "GET", "/backend-api/codex/models", None, {"Authorization": "Bearer test-two"}
+            )
             self.assertEqual(fetch.call_count, 2)
 
     def test_catalog_cache_is_isolated_by_account_header(self):
@@ -721,13 +757,13 @@ class ProxyTests(unittest.TestCase):
         ):
             one = proxy.request_with_retry(
                 "GET",
-                "/models",
+                "/backend-api/codex/models",
                 None,
                 {"Authorization": "Bearer test-only", "ChatGPT-Account-ID": "one"},
             )
             two = proxy.request_with_retry(
                 "GET",
-                "/models",
+                "/backend-api/codex/models",
                 None,
                 {"Authorization": "Bearer test-only", "chatgpt-account-id": "two"},
             )
@@ -738,10 +774,18 @@ class ProxyTests(unittest.TestCase):
         proxy = self.load_proxy()
         first = (200, {}, b'{"models":[{"slug":"account-one"}]}')
         second = (200, {}, b'{"models":[{"slug":"account-two"}]}')
-        proxy.MODEL_CATALOG_CACHE = (("/models", "Bearer test-only", "one"), 200, first)
+        proxy.MODEL_CATALOG_CACHE = (
+            ("/backend-api/codex/models", "Bearer test-only", "one"),
+            200,
+            first,
+        )
 
         def concurrent_refresh():
-            proxy.MODEL_CATALOG_CACHE = (("/models", "Bearer test-only", "two"), 200, second)
+            proxy.MODEL_CATALOG_CACHE = (
+                ("/backend-api/codex/models", "Bearer test-only", "two"),
+                200,
+                second,
+            )
             return 100
 
         with (
@@ -750,14 +794,14 @@ class ProxyTests(unittest.TestCase):
         ):
             result = proxy.request_with_retry(
                 "GET",
-                "/models",
+                "/backend-api/codex/models",
                 None,
                 {"Authorization": "Bearer test-only", "ChatGPT-Account-ID": "one"},
             )
             self.assertEqual(result, first)
             fetch.assert_not_called()
 
-    def test_invalid_catalog_is_not_cached_or_retried(self):
+    def test_invalid_catalog_is_not_cached(self):
         for bad in (b'{"models":[', b'{"output":[]}', b"null"):
             with self.subTest(body=bad):
                 proxy = self.load_proxy()
@@ -769,13 +813,16 @@ class ProxyTests(unittest.TestCase):
                 ):
                     proxy.request_with_retry(
                         "GET",
-                        "/models",
+                        "/backend-api/codex/models",
                         None,
                         {"Authorization": "Bearer test-only"},
-                        pause=lambda _: self.fail("Catalog refresh must not retry"),
+                        pause=lambda _: None,
                     )
                     result = proxy.request_with_retry(
-                        "GET", "/models", None, {"Authorization": "Bearer test-only"}
+                        "GET",
+                        "/backend-api/codex/models",
+                        None,
+                        {"Authorization": "Bearer test-only"},
                     )
                     self.assertEqual(result, valid)
                     self.assertEqual(fetch.call_count, 2)
@@ -811,14 +858,18 @@ class ProxyTests(unittest.TestCase):
             ):
                 result = proxy.request_with_retry(
                     "GET",
-                    "/models",
+                    "/backend-api/codex/models",
                     None,
                     {},
-                    pause=lambda _: self.fail("Model refresh must not retry"),
+                    pause=lambda _: None,
                 )
-                self.assertEqual(result[0], 502)
+                self.assertEqual(result[0], 400)
+                self.assertEqual(json.loads(result[2])["attempts"], 4)
                 self.assertEqual(
-                    proxy.request_with_retry("POST", "/responses/compact", b"{}", {})[0], 200
+                    proxy.request_with_retry(
+                        "POST", "/backend-api/codex/responses/compact", b"{}", {}
+                    )[0],
+                    200,
                 )
         finally:
             server.shutdown()
@@ -855,69 +906,194 @@ class ProxyTests(unittest.TestCase):
             proxy.configure(config, False)
             self.assertEqual(config.read_text(), original)
 
-    def test_image_routes_forward_once_without_model_retries(self):
+    def test_all_paths_and_methods_retry_and_preserve_the_request(self):
         proxy = self.load_proxy()
+        calls = []
+        delays = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def respond(self):
+                payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                key = (self.command, self.path)
+                previous = sum(call[:2] == key for call in calls)
+                calls.append((self.command, self.path, payload, self.headers.get("Authorization")))
+                status = 503 if previous == 0 else 200
+                body = b"temporary" if previous == 0 else b"\x89PNG\r\n\x1a\nvalid"
+                self.send_response(status)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Test-Response", "preserved")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = respond
+            do_HEAD = do_OPTIONS = do_PROPFIND = respond
+
+            def log_message(self, *args):
+                pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
         server = ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        results = [
-            (
-                200,
-                {"Content-Type": "application/json", "X-Codex-Imagegen-Request-Id": "test-image"},
-                b'{"data":[{"b64_json":"test-only"}]}',
-            ),
-            (
-                507,
-                {"Content-Type": "text/plain"},
-                b"exceeded request buffer limit while retrying upstream",
-            ),
+        for service in (upstream, server):
+            threading.Thread(target=service.serve_forever, daemon=True).start()
+        cases = [
+            ("GET", "/backend-api/codex/models?test=1"),
+            ("POST", "/backend-api/codex/images/generations?test=1"),
+            ("POST", "/backend-api/codex/images/edits?test=1"),
+            ("GET", "/backend-api/wham/usage?test=1"),
+            ("PUT", "/future-feature?test=1"),
+            ("PATCH", "/backend-api/codex/future-feature?test=1"),
+            ("DELETE", "/future-feature?test=1"),
+            ("HEAD", "/future-feature?test=1"),
+            ("OPTIONS", "/future-feature?test=1"),
+            ("PROPFIND", "/future-feature?test=1"),
         ]
         try:
-            for path in ("/images/generations", "/images/edits"):
-                for result in results:
-                    payload = b'{"prompt":"test-only"}'
-                    request = urllib.request.Request(
-                        f"http://127.0.0.1:{server.server_port}/backend-api/codex{path}?test=1",
-                        data=payload,
-                        headers={
-                            "Authorization": "Bearer test-only",
-                            "ChatGPT-Account-ID": "test-account",
-                            "Content-Type": "application/json",
-                        },
-                    )
-                    with (
-                        self.subTest(path=path, status=result[0]),
-                        patch.object(proxy, "fetch", return_value=result) as fetch,
-                        patch.object(
-                            proxy,
-                            "request_with_retry",
-                            side_effect=AssertionError("Image calls must not use model retries"),
-                        ),
-                        patch.object(proxy, "log_event"),
-                    ):
-                        try:
-                            response = opener.open(request, timeout=2)
-                        except urllib.error.HTTPError as error:
-                            response = error
-                        with response:
-                            self.assertEqual(response.status, result[0])
-                            self.assertEqual(response.read(), result[2])
-                            if result[0] == 200:
-                                self.assertEqual(
-                                    response.headers["X-Codex-Imagegen-Request-Id"], "test-image"
-                                )
-                        fetch.assert_called_once()
-                        method, forwarded_path, body, headers, timeout = fetch.call_args.args
-                        self.assertEqual(
-                            (method, forwarded_path, body, timeout),
-                            ("POST", path + "?test=1", payload, 300),
+            with (
+                patch.object(proxy, "UPSTREAM", f"http://127.0.0.1:{upstream.server_port}"),
+                patch.object(proxy.Handler, "pause", side_effect=delays.append),
+                patch.object(proxy, "log_event"),
+            ):
+                for method, path in cases:
+                    with self.subTest(method=method, path=path):
+                        connection = http.client.HTTPConnection(
+                            "127.0.0.1", server.server_port, timeout=3
                         )
-                        forwarded = {key.lower(): value for key, value in headers.items()}
-                        self.assertEqual(forwarded["authorization"], "Bearer test-only")
-                        self.assertEqual(forwarded["chatgpt-account-id"], "test-account")
+                        try:
+                            connection.request(
+                                method,
+                                path,
+                                body=b"\x00test-payload\xff",
+                                headers={"Authorization": "Bearer test-only"},
+                            )
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.headers["X-Test-Response"], "preserved")
+                            self.assertEqual(response.headers["Content-Length"], "13")
+                            self.assertEqual(
+                                response.read(),
+                                b"" if method == "HEAD" else b"\x89PNG\r\n\x1a\nvalid",
+                            )
+                        finally:
+                            connection.close()
+                self.assertEqual(delays, [30] * len(cases))
+                self.assertEqual(
+                    calls,
+                    [
+                        (method, path, b"\x00test-payload\xff", "Bearer test-only")
+                        for method, path in cases
+                        for _ in range(2)
+                    ],
+                )
         finally:
-            server.shutdown()
-            server.server_close()
+            for service in (server, upstream):
+                service.shutdown()
+                service.server_close()
+
+    def test_non_model_success_bodies_and_errors_are_not_misclassified(self):
+        proxy = self.load_proxy()
+        for status, content_type, body in [
+            (200, "image/png", b"\x89PNG\r\n\x1a\nvalid"),
+            (200, "text/plain", b"okay"),
+            (200, "application/json", b'["okay"]'),
+            (201, "application/json", b'{"created":true}'),
+            (200, "application/json", b""),
+            (204, "application/json", b""),
+            (
+                200,
+                "text/event-stream",
+                b'data: {"type":"response.failed","response":null}\n\n',
+            ),
+            (404, "text/plain", b"upstream route is unavailable"),
+        ]:
+            with self.subTest(status=status, content_type=content_type):
+                result = (status, {"Content-Type": content_type}, body)
+                with (
+                    patch.object(proxy, "fetch", return_value=result) as fetch,
+                    patch.object(proxy, "log_event"),
+                ):
+                    actual = proxy.request_with_retry(
+                        "POST",
+                        "/future-feature",
+                        b"{}",
+                        {},
+                        pause=lambda _: self.fail("A valid or terminal response must not retry"),
+                    )
+                self.assertEqual(actual, result)
+                self.assertEqual(fetch.call_count, 1)
+
+    def test_all_methods_use_the_same_retry_budget_for_generic_failures(self):
+        proxy = self.load_proxy()
+        for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "PROPFIND"):
+            for failure in (
+                (507, {}, b"exceeded request buffer limit while retrying upstream"),
+                (503, {"Content-Type": "text/event-stream"}, b"data: temporary\n\n"),
+                (
+                    503,
+                    {"Content-Type": "text/event-stream"},
+                    b'data: {"type":"error","code":"unknown_temporary_error"}\n\n',
+                ),
+                (
+                    503,
+                    {"Content-Type": "text/event-stream"},
+                    b'data: {"type":"error","error":null}\n\n',
+                ),
+                (
+                    503,
+                    {"Content-Type": "text/event-stream"},
+                    b'data: {"type":"response.failed","response":{"error":null}}\n\n',
+                ),
+                (
+                    503,
+                    {"Content-Type": "text/event-stream"},
+                    b'data: {"type":"response.failed","response":null}\n\n',
+                ),
+                (
+                    503,
+                    {"Content-Type": "text/event-stream"},
+                    b'data: {"type":"response.incomplete"}\n\n',
+                ),
+            ):
+                delays = []
+                with (
+                    self.subTest(method=method, failure=failure),
+                    patch.object(proxy, "fetch", return_value=failure) as fetch,
+                    patch.object(proxy, "log_event"),
+                ):
+                    result = proxy.request_with_retry(
+                        method, "/future-feature", b"{}", {}, pause=delays.append
+                    )
+                self.assertEqual(result[0], 400)
+                self.assertEqual(json.loads(result[2])["attempts"], 4)
+                self.assertEqual(fetch.call_count, 4)
+                self.assertEqual(delays, [30, 60, 120])
+
+    def test_bare_paths_do_not_use_codex_validation_or_catalog_cache(self):
+        proxy = self.load_proxy()
+        for method, path, body in (
+            ("POST", "/responses", b"okay"),
+            ("POST", "/responses/compact", b"okay"),
+            ("GET", "/models", b'{"models":[]}'),
+        ):
+            result = (200, {}, body)
+            with (
+                self.subTest(method=method, path=path),
+                patch.object(proxy, "fetch", return_value=result) as fetch,
+                patch.object(proxy, "log_event"),
+            ):
+                for _ in range(2):
+                    self.assertEqual(
+                        proxy.request_with_retry(
+                            method,
+                            path,
+                            None,
+                            {},
+                            pause=lambda _: self.fail("A bare path must not use model validation"),
+                        ),
+                        result,
+                    )
+                self.assertEqual(fetch.call_count, 2)
 
     def test_image_routes_preserve_auth_origin_and_size_guards(self):
         proxy = self.load_proxy()
@@ -936,7 +1112,6 @@ class ProxyTests(unittest.TestCase):
                 {"Authorization": "Bearer test-only", "Content-Length": str(proxy.MAX_BODY + 1)},
                 413,
             ),
-            ("GET", {"Authorization": "Bearer test-only"}, 404),
         ]
         try:
             for path in ("/images/generations", "/images/edits"):
@@ -969,7 +1144,7 @@ class ProxyTests(unittest.TestCase):
                 connection.request(
                     "POST",
                     "http://example.invalid/backend-api/codex/images/generations",
-                    body=b"{}",
+                    body=b"",
                     headers={"Authorization": "Bearer test-only"},
                 )
                 response = connection.getresponse()
@@ -991,7 +1166,7 @@ class ProxyTests(unittest.TestCase):
                 self.assertEqual(json.load(response)["service"], "codex-transient-retry")
             for path, expected in [
                 ("/backend-api/codex/responses", 401),
-                ("/backend-api/codex/anything", 404),
+                ("/backend-api/codex/anything", 401),
             ]:
                 with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as error:
                     urllib.request.urlopen(

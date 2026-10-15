@@ -7,7 +7,7 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows-blue)](docs/windows.md)
 [![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-Add local automatic retries to Codex model requests and remote context compaction. This helper runs on Windows, reuses your ChatGPT sign-in and model selection, and requires only the Python standard library at runtime.
+Add local automatic retries to every request sent to the Codex gateway, including model requests, remote context compaction, images, and model catalogs. This helper runs on Windows, reuses your ChatGPT sign-in and model selection, and requires only the Python standard library at runtime.
 
 **The proxy buffers each response in full, delaying text and tool calls.** This is an unofficial helper that depends on Codex backend interfaces and the client's HTTP fallback behavior.
 
@@ -28,12 +28,12 @@ Add local automatic retries to Codex model requests and remote context compactio
 
 This helper is intended for personal use on one machine:
 
-- Retry recognized model capacity errors, server overload, and interrupted responses for inference and remote compaction
+- Retry recognized temporary failures for every forwarded path and HTTP method
 - Buffer each response and discard failed attempts before delivering partial output or local tool calls
 - Start at Windows sign-in through a scheduled task, with configuration backups and rollback support
-- Forward built-in image generation and editing requests without adding local retries
+- Forward images and new backend routes through the same retry loop, without a route whitelist
 
-Persistent failures can still exhaust the retry budget. Explicit authentication, quota, context-length, and invalid-request errors return immediately. Other backend routes and sign-in methods are outside the current validation scope.
+Persistent failures can still exhaust the retry budget. Explicit authentication, quota, context-length, and invalid-request errors return immediately. Only requests sent to the configured gateway are covered; desktop login, updates, and third-party plugins using separate connections are not automatically rerouted.
 
 ## Quick start
 
@@ -78,7 +78,7 @@ Invoke-RestMethod 'http://127.0.0.1:18761/health'
 Get-ScheduledTask -TaskName 'CodexTransientRetry'
 ```
 
-The health response should include `service: codex-transient-retry` and `version: 7`. This `version` is the service revision; the Python project version is `0.5.2`. Reopen Codex after these checks so new connections use the local proxy.
+The health response should include `service: codex-transient-retry` and `version: 8`. This `version` is the service revision; the Python project version is `0.6.0`. Reopen Codex after these checks so new connections use the local proxy.
 
 ## Stop and roll back
 
@@ -94,7 +94,7 @@ The script refuses to overwrite managed blocks that you edited manually. See [Wi
 
 ## How it works
 
-Codex sends each model request to the local proxy. The proxy forwards the existing authentication headers, buffers the response, and checks whether to return it or retry:
+Codex sends requests to the local proxy. Every forwarded request uses the existing authentication headers, buffers the response, and checks whether to return it or retry:
 
 ```mermaid
 flowchart TD
@@ -109,13 +109,13 @@ flowchart TD
     E --> C
 ```
 
-The upstream address is fixed at `https://chatgpt.com/backend-api/codex`. Outbound connections can use environment or system proxy settings. This helper does not configure proxy software or select network nodes.
+The upstream origin is fixed at `https://chatgpt.com`; the original request path and query are preserved. Outbound connections can use environment or system proxy settings. This helper does not configure proxy software or select network nodes.
 
 Buffering applies to one model request at a time. Partial text and local tool calls from failed attempts are not delivered early. Buffering cannot undo server-side operations or guarantee that the backend executes a request only once. See the [architecture guide (Chinese)](docs/architecture.md) for protocol parsing and HTTP fallback details.
 
 ## Retry policy and supported routes
 
-Model and compaction requests use these defaults. A valid `Retry-After` can extend the wait:
+Every forwarded request uses these defaults. A valid `Retry-After` can extend the wait:
 
 HTTP 507 also qualifies when the response body contains `exceeded request buffer limit while retrying upstream` (case-insensitive). Explicit non-retryable error codes still take precedence; status 507 alone does not trigger a retry.
 
@@ -127,20 +127,19 @@ HTTP 507 also qualifies when the response body contains `exceeded request buffer
 | Explicit non-retryable errors | Authentication failure, insufficient quota, context overflow, missing models, invalid requests, and similar errors |
 | Exhausted budget | Return `local_retry_limit_exceeded` with the attempt count and last reason |
 
-The proxy supports these routes. Model catalog requests have a separate, shorter timeout:
+There is no route or HTTP method whitelist. Unknown paths reach the upstream, and upstream errors return according to the same policy. A few requests retain protocol-specific handling:
 
 | Request | Behavior |
 | --- | --- |
 | `POST /backend-api/codex/responses` | Buffer model responses and retry temporary failures |
 | `POST /backend-api/codex/responses/compact` | Buffer remote compaction responses and retry temporary failures |
-| `POST /backend-api/codex/images/generations` | Forward once to the fixed upstream, without local retries |
-| `POST /backend-api/codex/images/edits` | Forward once to the fixed upstream, without local retries |
-| `GET /backend-api/codex/models` | Forward once; cache a valid catalog for 5 minutes per matching credential and account, with a 3-second connection/read idle timeout |
+| Images and all other authenticated HTTP methods and paths | Buffer and retry recognized temporary failures |
+| `GET /backend-api/codex/models` | Retry temporary failures; cache a valid catalog for 5 minutes per matching credential and account, with a 3-second connection/read idle timeout per attempt |
 | `GET /health` | Return the service revision, process information, and retry parameters |
 
 Inference connection/read idle timeouts are at most 300 seconds, and the retry scheduling budget is 900 seconds. A slowly but continuously transmitting response can exceed these values. **The 900-second budget is not a hard limit on total request duration.**
 
-Image requests keep their original payload and authentication headers. The local proxy forwards each request once, with a 300-second connection/read idle timeout, and returns the upstream status and body. Model retry rules, including the matching 507 rule, do not apply to image calls; this avoids adding duplicate generation attempts.
+Image requests and other writes keep their original payload and headers, including any caller-provided idempotency key. They use the same retry policy, including the matching 507 rule. If the upstream completed an operation before its response was lost, retrying can repeat the operation or charge. GET catalog failures also wait through the retry delays, so startup can take longer during an outage.
 
 The proxy listens only on loopback, limits each request and response to 64 MiB, and refuses upstream redirects. It does not forward WebSocket connections or impose global concurrency or memory quotas. Revalidate compatibility after upgrading Codex.
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Remove the route and HTTP method whitelist; preserve incoming paths and queries when forwarding to the fixed ChatGPT origin.
+- Apply the existing retry budget and backoff to every forwarded request, including images, model catalogs, writes, and new routes.
+- Preserve binary, text, JSON array, empty, and HEAD responses while retaining model stream validation and request guards.
+- Document repeated-operation risks, catalog delays during outages, and the boundary between gateway traffic and separate desktop or plugin connections.
+- Advance the service revision to 8.
+
 ## 0.5.2
 
 - Forward built-in image generation and editing routes to the fixed Codex upstream, resolving local `404 / Unknown route` errors.

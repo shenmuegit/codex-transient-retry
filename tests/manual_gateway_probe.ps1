@@ -5,7 +5,7 @@ function Get-ScheduledTask {
     [CmdletBinding()] param([string]$TaskName)
     $null
 }
-function Invoke-RestMethod { [PSCustomObject]@{service = 'codex-transient-retry'; version = 8} }
+function Invoke-RestMethod { [PSCustomObject]@{service = 'codex-transient-retry'; version = 12} }
 function New-ScheduledTaskAction { [PSCustomObject]@{} }
 function New-ScheduledTaskTrigger { [PSCustomObject]@{} }
 function New-ScheduledTaskPrincipal { [PSCustomObject]@{} }

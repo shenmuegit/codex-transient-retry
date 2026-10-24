@@ -6,6 +6,7 @@ $retryArguments = '"' + $retryScript + '" --serve'
 $retryTaskName = 'CodexTransientRetry'
 $retryNeedsRestart = $false
 $retryHealth = $null
+$retryRuntime = if ($env:CODEX_RETRY_RUNTIME_DIR) { $env:CODEX_RETRY_RUNTIME_DIR } else { Join-Path $PSScriptRoot 'local-diagnostics\transient-retry' }
 
 if (-not (Test-Path -LiteralPath $retryPythonw)) {
     throw 'Python 3.11 or newer, including pythonw.exe, is required.'
@@ -21,7 +22,7 @@ try {
     if ($retryHealth.service -ne 'codex-transient-retry') {
         throw 'Port 18761 is already used by another service.'
     }
-    $retryNeedsRestart = $retryHealth.version -ne 8
+    $retryNeedsRestart = $retryHealth.version -ne 12
 } catch {
     $retryListener = Get-NetTCPConnection -LocalPort 18761 -State Listen -ErrorAction SilentlyContinue
     if ($retryListener) {
@@ -53,7 +54,7 @@ $retryReady = $false
 for ($retryCheck = 0; $retryCheck -lt 40; $retryCheck++) {
     try {
         $retryHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:18761/health' -TimeoutSec 1
-        if (($retryHealth.service -eq 'codex-transient-retry') -and ($retryHealth.version -eq 8)) {
+        if (($retryHealth.service -eq 'codex-transient-retry') -and ($retryHealth.version -eq 12)) {
             $retryReady = $true
             break
         }
@@ -69,7 +70,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Could not apply the retry provider; the previous configuration was retained.'
 }
 $retryApply = $retryApplyOutput | ConvertFrom-Json
-& codex features list | Out-Null
+& codex -c ('log_dir="' + (Join-Path $retryRuntime 'codex-logs').Replace('\', '/') + '"') features list | Out-Null
 if ($LASTEXITCODE -ne 0) {
     if (-not $retryApply.unchanged) {
         $retryConfigHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
@@ -78,18 +79,12 @@ if ($LASTEXITCODE -ne 0) {
         if ($LASTEXITCODE -ne 0 -or $retryCurrentHash -ne $retryApply.config_sha256) {
             throw 'Codex validation failed and configuration changed meanwhile; it was left untouched.'
         }
-        $retryRollbackTemp = $retryConfigPath + '.retry-rollback-' + [Guid]::NewGuid().ToString('N') + '.tmp'
-        try {
-            Copy-Item -LiteralPath $retryApply.operation_backup -Destination $retryRollbackTemp
-            [System.IO.File]::Replace($retryRollbackTemp, $retryConfigPath, [NullString]::Value)
-        } finally {
-            if (Test-Path -LiteralPath $retryRollbackTemp) { Remove-Item -LiteralPath $retryRollbackTemp }
-        }
+        [System.IO.File]::WriteAllBytes($retryConfigPath, [System.IO.File]::ReadAllBytes($retryApply.operation_backup))
     }
     throw 'Codex rejected the retry provider; the prior configuration was preserved or restored.'
 }
 
-Write-Output 'Enabled: localhost port 18761; retry delays 30, 60, 120 seconds; at most 3 retries.'
+Write-Output 'Enabled: localhost port 18761; retry delays 30, 60, 120 seconds; at most 3 proxy retries per incoming request.'
 Write-Output 'The helper starts automatically at Windows sign-in.'
-Write-Output 'The default provider stays OpenAI. Model catalog I/O timeout: 3 seconds; inference retry budget is unchanged.'
+Write-Output 'The built-in OpenAI provider and authentication are preserved for Dot compatibility. Native client retries remain enabled and can multiply proxy attempts.'
 Write-Output 'Restart Codex when convenient to reload existing connections.'

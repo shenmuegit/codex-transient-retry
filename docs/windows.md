@@ -14,7 +14,7 @@ Get-ScheduledTask -TaskName 'CodexTransientRetry'
 
 脚本注册当前用户的登录触发任务，使用 `pythonw.exe` 启动当前目录中的 `retry_proxy.py --serve`，检查健康端点后才修改 Codex 配置。最后完全退出并重新打开 Codex。
 
-不要在任务仍引用该目录时删除或移动目录。健康端点中的 `version: 8` 是服务修订号；Python 项目发行版本为 `0.6.0`。
+不要在任务仍引用该目录时删除或移动目录。健康端点中的 `version: 12` 是服务修订号；Python 项目发行版本为 `0.6.0`。
 
 ## 从旧目录迁移
 
@@ -54,13 +54,13 @@ python retry_proxy.py --configure disable
 
 ## 运行数据
 
-配置目录优先使用 `CODEX_HOME`，否则为 `%USERPROFILE%\.codex`：
+Codex 配置目录优先使用 `CODEX_HOME`，否则为 `%USERPROFILE%\.codex`。日志、回滚状态和备份默认放在项目的 `local-diagnostics/transient-retry/`，可通过 `CODEX_RETRY_RUNTIME_DIR` 指定运行目录：
 
 - `config.toml`：Codex 配置，包含有起止标记的代理管理块。
-- `config.toml.retry-backup-*.bak`：原始配置备份。
-- `config.toml.retry-upgrade-*.bak`：升级前备份。
-- `transient-retry/config-state.json`：回滚所需的备份位置等状态。
-- `transient-retry/proxy.log`：代理元数据日志，按大小轮换。
+- 运行目录中的 `config.toml.retry-backup-*.bak`：原始配置备份。
+- 运行目录中的 `config.toml.retry-upgrade-*.bak`：升级前备份。
+- 运行目录中的 `config-state.json`：回滚所需的备份位置等状态。
+- 运行目录中的 `proxy.log`：代理元数据日志，按大小轮换。
 
 配置备份可能包含原配置中的秘密，不能上传项目仓库。启停脚本会验证当前 Codex 是否接受配置；用户编辑过管理块时会拒绝覆盖，需先核对内容。缺失配置文件时会创建空配置，回滚后保留这个空文件或后来添加的用户设置。
 
@@ -68,6 +68,8 @@ python retry_proxy.py --configure disable
 
 ## 常见排查
 
-健康检查失败时，先查 18761 端口、计划任务状态及日志。任务从其他目录安装时，按迁移流程操作。持续服务过载会在预算用尽后返回 `local_retry_limit_exceeded`，可保留其中的请求 ID 供排查。
+健康检查失败时，先查 18761 端口、计划任务状态及日志。任务从其他目录安装时，按迁移流程操作。重试耗尽后返回最后一次上游状态和正文，可结合日志中的 `exhausted` 和上游请求 ID 排查。升级到修订 10 时，脚本会备份并更新旧管理块，移除 WebSocket 禁用项及额外空闲超时。
 
 本程序不负责配置 VPN 或选择节点。需要网络代理时，确认代理进程启动环境／系统设置能访问上游，且本机回环地址可直接访问。
+
+修订 12 保留内置 `openai` provider，仅设置本机 `openai_base_url`，以兼容 Dot。升级会读取旧回滚状态，将原始备份复制到项目运行目录，恢复原 provider 行及其位置，并移除旧自定义 provider 块。客户端原生重试保持启用，可能叠加代理尝试；4 次仅为一次进入代理的请求预算。重新打开 Codex 加载提供商配置；重启代理加载运行代码及日志目录。

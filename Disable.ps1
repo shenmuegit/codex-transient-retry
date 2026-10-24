@@ -14,7 +14,8 @@ if ($retryTask) {
 if ($LASTEXITCODE -ne 0) {
     throw 'Configuration could not be restored; the helper remains running.'
 }
-& codex features list | Out-Null
+$retryRuntime = if ($env:CODEX_RETRY_RUNTIME_DIR) { $env:CODEX_RETRY_RUNTIME_DIR } else { Join-Path $PSScriptRoot 'local-diagnostics\transient-retry' }
+& codex -c ('log_dir="' + (Join-Path $retryRuntime 'codex-logs').Replace('\', '/') + '"') features list | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw 'Codex configuration needs attention; the helper remains running.'
 }

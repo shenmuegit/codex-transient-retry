@@ -50,9 +50,7 @@ class WindowsScriptTests(unittest.TestCase):
                     proxy.configure(config, True)
                 if scenario == "upgrade":
                     config.write_text(
-                        config.read_text().replace(
-                            proxy.CONFIG_HEADER, proxy.PREVIOUS_CONFIG_HEADER, 1
-                        )
+                        proxy.PREVIOUS_CONFIG_HEADER + 'model = "test-only"\n' + proxy.CONFIG_BLOCK
                     )
                 original = config.read_bytes()
                 result = subprocess.run(
@@ -68,6 +66,7 @@ class WindowsScriptTests(unittest.TestCase):
                     env=dict(
                         os.environ,
                         CODEX_HOME=directory,
+                        CODEX_RETRY_RUNTIME_DIR=str(Path(directory) / "transient-retry"),
                         RETRY_TEST_PROXY_SCRIPT=str(source),
                         RETRY_TEST_ENABLE_SCRIPT=str(tests.parent / "Enable.ps1"),
                         RETRY_TEST_SCENARIO=scenario,

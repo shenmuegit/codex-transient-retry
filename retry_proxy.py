@@ -1,12 +1,12 @@
-"""Buffer Codex responses and retry temporary upstream failures on localhost."""
+"""Forward Codex gateway requests and retry failed attempts on localhost."""
 
 import argparse
 import gzip
 import hashlib
 import http.client
-import io
 import json
 import logging
+import math
 import os
 import select
 import shutil
@@ -25,20 +25,15 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 UPSTREAM = "https://chatgpt.com"
-PREFIX = "/backend-api/codex"
 PORT = 18761
-PROXY_VERSION = 8
+PROXY_VERSION = 12
 DELAYS = (30, 60, 120)
-MODEL_CATALOG_TIMEOUT = 3
-MAX_BODY = 64 * 1024 * 1024
-DEADLINE_SECONDS = 900
-UPSTREAM_RETRY_BUFFER_MESSAGE = "exceeded request buffer limit while retrying upstream"
+# HTTP framing and connection-scoped headers are regenerated on each hop.
 HOP_HEADERS = {
     "host",
     "connection",
     "content-length",
     "transfer-encoding",
-    "accept-encoding",
     "proxy-authorization",
     "proxy-authenticate",
     "keep-alive",
@@ -46,39 +41,15 @@ HOP_HEADERS = {
     "trailer",
     "upgrade",
 }
-RETRY_CODES = {
-    "model_capacity_exceeded",
-    "model_capacity",
-    "server_error",
-    "internal_error",
-    "server_is_overloaded",
-    "server_overloaded",
-    "service_unavailable_error",
-    "rate_limit_exceeded",
-    "connection_error",
-}
-BLOCK_CODES = {
-    "insufficient_quota",
-    "usage_limit_exceeded",
-    "credit_balance_exhausted",
-    "project_spend_limit_exceeded",
-    "organization_spend_limit_exceeded",
-    "organization_usage_limit_exceeded",
-    "authentication_error",
-    "invalid_api_key",
-    "context_length_exceeded",
-    "model_not_found",
-    "invalid_request_error",
-    "response_too_large",
-    "unexpected_redirect",
-}
 LOGGER = logging.getLogger("codex-transient-retry")
-MODEL_CATALOG_CACHE = None
 PROVIDER = "openai_transient_retry"
 LEGACY_CONFIG_HEADER = '# BEGIN CODEX TRANSIENT RETRY\nmodel_provider = "openai_transient_retry"\n# END CODEX TRANSIENT RETRY HEADER\n'
 PREVIOUS_CONFIG_HEADER = '# BEGIN CODEX TRANSIENT RETRY\nmodel_provider = "openai_transient_retry"\nopenai_base_url = "http://127.0.0.1:18761/backend-api/codex"\n# END CODEX TRANSIENT RETRY HEADER\n'
-CONFIG_HEADER = '# BEGIN CODEX TRANSIENT RETRY\nopenai_base_url = "http://127.0.0.1:18761/backend-api/codex"\n# END CODEX TRANSIENT RETRY HEADER\n'
-CONFIG_BLOCK = """\n# BEGIN CODEX TRANSIENT RETRY PROVIDER
+BUILTIN_CONFIG_HEADER = '# BEGIN CODEX TRANSIENT RETRY\nopenai_base_url = "http://127.0.0.1:18761/backend-api/codex"\n# END CODEX TRANSIENT RETRY HEADER\n'
+CONFIG_HEADER = BUILTIN_CONFIG_HEADER
+PROVIDER_LINE_MARKER = "# CODEX TRANSIENT RETRY ORIGINAL PROVIDER\n"
+# Recognize old installations for migration; this block is never applied.
+LEGACY_CONFIG_BLOCK = """\n# BEGIN CODEX TRANSIENT RETRY PROVIDER
 [model_providers.openai_transient_retry]
 name = "OpenAI"
 base_url = "http://127.0.0.1:18761/backend-api/codex"
@@ -91,14 +62,66 @@ stream_max_retries = 0
 stream_idle_timeout_ms = 900000
 # END CODEX TRANSIENT RETRY PROVIDER
 """
+CONFIG_BLOCK = LEGACY_CONFIG_BLOCK.replace(
+    "supports_websockets = false\n", "supports_websockets = true\n"
+).replace("stream_idle_timeout_ms = 900000\n", "")
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, message, headers, new_url):
-        return None
+class ForwardHTTPHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    def do_open(self, http_class, request, **kwargs):
+        connection = http_class(request.host, timeout=request.timeout, **kwargs)
+        headers = list(getattr(request, "forwarded_headers", request.header_items()))
+        names = {key.lower() for key, _ in headers}
+        headers.extend(
+            (key, value) for key, value in request.header_items() if key.lower() not in names
+        )
+        if request._tunnel_host:
+            tunnel_headers = {
+                key: value for key, value in headers if key.lower() == "proxy-authorization"
+            }
+            headers = [
+                (key, value) for key, value in headers if key.lower() != "proxy-authorization"
+            ]
+            connection.set_tunnel(request._tunnel_host, headers=tunnel_headers)
+        if "upgrade" not in {key.lower() for key, _ in headers}:
+            headers = [(key, value) for key, value in headers if key.lower() != "connection"]
+            headers.append(("Connection", "close"))
+        try:
+            connection.putrequest(
+                request.get_method(),
+                request.selector,
+                skip_host=True,
+                skip_accept_encoding=any(key.lower() == "accept-encoding" for key, _ in headers),
+            )
+            for key, value in headers:
+                connection.putheader(key, value)
+            connection.endheaders(request.data)
+            response = connection.getresponse()
+            if response.status == 101:
+                response.upstream_socket = connection.sock
+                connection.sock = None
+            elif connection.sock:
+                connection.sock.close()
+                connection.sock = None
+            response.url = request.full_url
+            response.msg = response.reason
+            return response
+        except BaseException:
+            connection.close()
+            raise
+
+    def https_open(self, request):
+        return self.do_open(http.client.HTTPSConnection, request)
 
 
-OPENER = urllib.request.build_opener(NoRedirect)
+class ForwardHTTPStatus(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request, response):
+        return response
+
+    https_response = http_response
+
+
+OPENER = urllib.request.build_opener(ForwardHTTPHandler, ForwardHTTPStatus)
 
 
 class ClientDisconnected(Exception):
@@ -110,55 +133,43 @@ def log_event(event, **fields):
 
 
 def error_reason(error, status=None):
-    if not isinstance(error, dict):
-        return None
-    code = str(error.get("code", "")).lower()
-    message = str(error.get("message", "")).lower()
-    if code in BLOCK_CODES:
-        return None
-    if code in RETRY_CODES:
-        return code
-    if status == 507 and UPSTREAM_RETRY_BUFFER_MESSAGE in message:
-        return "upstream_retry_buffer_limit"
-    if "selected model is at capacity" in message:
-        return "model_capacity"
-    if "an error occurred while processing your request" in message:
-        return "server_error"
-    return "upstream_" + str(status) if status in (429, 500, 502, 503, 504) else None
+    if isinstance(error, dict) and error.get("code"):
+        return str(error["code"]).lower()
+    return "upstream_" + str(status) if status and status >= 400 else "upstream_error"
 
 
-def retry_reason(status, headers, body, validate_response=True):
+def retry_reason(status, headers, body):
     headers = {k.lower(): v for k, v in headers.items()}
     json_response = "json" in headers.get("content-type", "").lower()
-    if status in (401, 403, 404, 413, 422):
+    if status >= 400:
+        return "upstream_" + str(status)
+    if not body:
         return None
-    if status == 200 and not validate_response and not body:
-        return None
-    if headers.get("content-encoding", "").lower() == "gzip":
+    for encoding in reversed(headers.get("content-encoding", "").lower().split(",")):
+        encoding = encoding.strip()
         try:
-            with gzip.GzipFile(fileobj=io.BytesIO(body)) as compressed:
-                body = compressed.read(MAX_BODY + 1)
+            if encoding == "gzip":
+                body = gzip.decompress(body)
+            elif encoding == "deflate":
+                try:
+                    body = zlib.decompress(body)
+                except zlib.error:
+                    body = zlib.decompress(body, -zlib.MAX_WBITS)
+            elif encoding and encoding != "identity":
+                return None
         except (OSError, EOFError, zlib.error):
             return "stream_disconnected"
-    if len(body) > MAX_BODY:
-        return None
+    sse_response = "text/event-stream" in headers.get("content-type", "").lower()
     try:
         text = body.decode("utf-8-sig")
     except UnicodeDecodeError:
-        if status == 200 and (validate_response or json_response):
+        if json_response or sse_response:
             return "stream_disconnected"
-        text = ""
-    fallback_reason = (
-        "upstream_retry_buffer_limit"
-        if status == 507 and UPSTREAM_RETRY_BUFFER_MESSAGE in text.lower()
-        else "upstream_" + str(status)
-        if status in (429, 500, 502, 503, 504)
-        else None
-    )
-    if "text/event-stream" in headers.get("content-type", "").lower() or text.lstrip(
-        "\ufeff \t\r\n"
-    ).startswith(("data:", "event:", ":")):
+        return None
+    text = text.lstrip("\ufeff")
+    if sse_response or text.lstrip().startswith(("data:", "event:", ":")):
         completed = False
+        response_events = False
         data_lines = []
         event_name = ""
         for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") + [""]:
@@ -178,161 +189,88 @@ def retry_reason(status, headers, body, validate_response=True):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:
-                if validate_response:
+                if response_events or data.lstrip().startswith("{"):
                     return "stream_disconnected"
                 continue
+            except (RecursionError, ValueError):
+                return None
             if not isinstance(event, dict):
-                if validate_response:
-                    return "stream_disconnected"
                 continue
             kind = event.get("type", event_name)
             event_name = ""
+            response_events |= isinstance(kind, str) and kind.startswith("response.")
             if kind == "error":
-                error = event.get("error", event)
-                return error_reason(error, status) if isinstance(error, dict) else fallback_reason
+                return error_reason(event.get("error", event), status)
             if kind == "response.failed":
                 response = event.get("response", {})
                 if not isinstance(response, dict):
-                    return "stream_disconnected" if validate_response else fallback_reason
-                error = response.get("error", {})
-                return error_reason(error, status) if isinstance(error, dict) else fallback_reason
+                    return "stream_disconnected"
+                return error_reason(response.get("error"), status)
             if kind == "response.incomplete":
-                return None if validate_response else fallback_reason
+                return None
             if kind == "response.completed":
                 completed = True
-        return fallback_reason if completed or not validate_response else "stream_disconnected"
+        return "stream_disconnected" if response_events and not completed else None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        if status == 200 and (validate_response or json_response):
+        if json_response:
             return "stream_disconnected"
-        data = {}
-    if status == 200 and validate_response and not isinstance(data, dict):
-        return "stream_disconnected"
-    if isinstance(data, dict) and isinstance(data.get("error"), dict):
-        error = data["error"]
-        if str(error.get("code", "")).lower() in BLOCK_CODES:
-            return None
-        reason = error_reason(error, status)
-        if reason:
-            return reason
-    return fallback_reason
+        return None
+    except (RecursionError, ValueError):
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict) or error:
+        return error_reason(error, status)
+    return None
 
 
-def fetch(method, path, body, headers, timeout):
-    forwarded = {k: v for k, v in headers.items() if k.lower() not in HOP_HEADERS}
-    forwarded["Accept-Encoding"] = "gzip"
+def fetch(method, path, body, headers, timeout=None):
+    upgrade = any(key.lower() == "upgrade" for key, _ in headers.items())
+    hop_headers = HOP_HEADERS - {"connection", "upgrade"} if upgrade else HOP_HEADERS
+    forwarded = [(key, value) for key, value in headers.items() if key.lower() not in hop_headers]
     request = urllib.request.Request(
-        UPSTREAM + path, data=body if body else None, headers=forwarded, method=method
+        UPSTREAM + (path if path.startswith("/") else "/" + path),
+        data=body if body else None,
+        headers=dict(forwarded),
+        method=method,
     )
-    try:
-        response = OPENER.open(request, timeout=timeout)
-    except urllib.error.HTTPError as error:
-        response = error
+    request.forwarded_headers = forwarded
+    if path == "*":
+        request.selector = path
+    response = OPENER.open(request, timeout=timeout)
+    log_event(
+        "upstream_headers",
+        path=path.split("?", 1)[0],
+        status=response.status,
+        content_type=response.headers.get("Content-Type"),
+    )
+    if response.status == 101:
+        return response.status, response.headers, response
     with response:
-        log_event(
-            "upstream_headers",
-            path=path.split("?", 1)[0],
-            status=response.status,
-            content_type=response.headers.get("Content-Type"),
-        )
-        if 300 <= response.status < 400 and response.status != 304:
-            return (
-                502,
-                {"Content-Type": "application/json"},
-                b'{"error":{"code":"unexpected_redirect","message":"Upstream redirect was not followed"}}',
-            )
-        data = response.read(MAX_BODY + 1)
-        response_headers = dict(response.headers.items())
-        if method != "HEAD" and response.headers.get("Content-Encoding", "").lower() == "gzip":
-            if data:
-                with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
-                    data = compressed.read(MAX_BODY + 1)
-            response_headers = {
-                k: v for k, v in response_headers.items() if k.lower() != "content-encoding"
-            }
-        if len(data) > MAX_BODY:
-            return (
-                502,
-                {"Content-Type": "application/json"},
-                b'{"error":{"code":"response_too_large","message":"Local retry buffer limit exceeded"}}',
-            )
-        return response.status, response_headers, data
-
-
-def retry_limit_reply(result, reason, attempts):
-    headers = {"Content-Type": "application/json"}
-    headers.update(
-        {k: v for k, v in result[1].items() if k.lower() in ("x-oai-request-id", "x-request-id")}
-    )
-    message = f"Local automatic retry limit reached after {attempts} attempts. Last transient error: {reason}. Please retry later."
-    body = json.dumps(
-        {
-            "error": {"code": "local_retry_limit_exceeded", "message": message},
-            "attempts": attempts,
-            "upstream_status": result[0],
-        }
-    ).encode()
-    # A terminal local error prevents the built-in provider from multiplying our retry budget.
-    return 400, headers, body
+        return response.status, response.headers, response.read()
 
 
 def request_with_retry(method, path, body, headers, cancelled=None, pause=None):
-    global MODEL_CATALOG_CACHE
     cancelled = cancelled or (lambda: False)
     pause = pause or time.sleep
-    catalog_key = None
-    request_path = path.split("?", 1)[0]
-    if method == "GET" and request_path == PREFIX + "/models":
-        authorization = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
-        account = next((v for k, v in headers.items() if k.lower() == "chatgpt-account-id"), "")
-        catalog_key = (path, authorization, account)
-        catalog_cache = MODEL_CATALOG_CACHE
-        if (
-            catalog_cache
-            and catalog_cache[0] == catalog_key
-            and catalog_cache[1] > time.monotonic()
-        ):
-            return catalog_cache[2]
-    deadline = time.monotonic() + DEADLINE_SECONDS
     for attempt in range(len(DELAYS) + 1):
         if cancelled():
             raise ClientDisconnected()
         try:
-            result = fetch(
-                method,
-                path,
-                body,
-                headers,
-                min(
-                    MODEL_CATALOG_TIMEOUT if catalog_key else 300,
-                    max(1, deadline - time.monotonic()),
-                ),
-            )
+            result = fetch(method, path, body, headers)
         except (urllib.error.URLError, OSError, EOFError, zlib.error, http.client.HTTPException):
             result = (
                 502,
                 {"Content-Type": "application/json"},
                 b'{"error":{"code":"connection_error","message":"Upstream connection ended before completion"}}',
             )
+        if result[0] == 101:
+            return result
         if cancelled():
             raise ClientDisconnected()
         status, response_headers, response_body = result
-        reason = retry_reason(
-            status,
-            {} if method == "HEAD" else response_headers,
-            response_body,
-            validate_response=method == "POST"
-            and request_path in (PREFIX + "/responses", PREFIX + "/responses/compact"),
-        )
-        if catalog_key and status == 200 and not reason:
-            try:
-                catalog = json.loads(response_body.decode("utf-8-sig"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                catalog = None
-            if isinstance(catalog, dict) and isinstance(catalog.get("models"), list):
-                # Catalog refreshes have a short timeout; reuse only a valid matching account catalog.
-                MODEL_CATALOG_CACHE = (catalog_key, time.monotonic() + 300, result)
+        reason = retry_reason(status, response_headers, response_body)
         if not reason:
             log_event(
                 "finished",
@@ -350,13 +288,16 @@ def request_with_retry(method, path, body, headers, cancelled=None, pause=None):
                 status=status,
                 reason=reason,
             )
-            return retry_limit_reply(result, reason, attempt + 1)
+            return result
         delay = DELAYS[attempt]
         retry_after = next(
             (v for k, v in response_headers.items() if k.lower() == "retry-after"), ""
         )
         try:
-            delay = max(delay, float(retry_after))
+            retry_after_seconds = float(retry_after)
+            if not math.isfinite(retry_after_seconds):
+                raise ValueError("Invalid Retry-After")
+            delay = max(delay, retry_after_seconds)
         except (ValueError, TypeError):
             try:
                 delay = max(
@@ -367,9 +308,6 @@ def request_with_retry(method, path, body, headers, cancelled=None, pause=None):
                 )
             except (ValueError, TypeError, OverflowError):
                 pass
-        if time.monotonic() + delay >= deadline:
-            log_event("deadline", path=path.split("?", 1)[0], reason=reason)
-            return retry_limit_reply(result, reason, attempt + 1)
         log_event(
             "retry",
             path=path.split("?", 1)[0],
@@ -387,9 +325,20 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def reply(self, status, headers, body):
-        self.send_response(status)
+        self.send_response_only(status)
+        if status == 101:
+            try:
+                for key, value in headers.items():
+                    if key.lower() not in HOP_HEADERS - {"connection", "upgrade"}:
+                        self.send_header(key, value)
+                self.end_headers()
+                self.close_connection = True
+                return self.relay(body)
+            finally:
+                body.close()
+                body.upstream_socket.close()
         for key, value in headers.items():
-            if key.lower() not in HOP_HEADERS | {"server", "date"}:
+            if key.lower() not in HOP_HEADERS:
                 self.send_header(key, value)
         length = (
             next(
@@ -405,6 +354,53 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
         self.close_connection = True
+
+    def relay(self, response):
+        upstream = response.upstream_socket
+
+        def copy(reader, destination):
+            try:
+                read = getattr(reader, "read1", reader.read)
+                while data := read(65536):
+                    destination.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for connection in (self.connection, upstream):
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        worker = threading.Thread(target=copy, args=(response.fp, self.connection), daemon=True)
+        worker.start()
+        try:
+            copy(self.rfile, upstream)
+        finally:
+            worker.join()
+
+    def read_body(self):
+        if self.headers.get("Transfer-Encoding", "").strip().lower().endswith("chunked"):
+            body = bytearray()
+            while True:
+                size = int(self.rfile.readline().split(b";", 1)[0], 16)
+                if size < 0:
+                    raise ValueError("Invalid chunk size")
+                if not size:
+                    for key, value in http.client.parse_headers(self.rfile).items():
+                        self.headers[key] = value
+                    return bytes(body)
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                    raise ClientDisconnected()
+                body.extend(chunk)
+        length = int(self.headers.get("Content-Length", "0"))
+        if length < 0:
+            raise ValueError("Invalid Content-Length")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ClientDisconnected()
+        return body
 
     def cancelled(self):
         try:
@@ -426,7 +422,6 @@ class Handler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
     def handle_request(self):
-        self.connection.settimeout(30)
         try:
             if self.command == "GET" and self.path == "/health":
                 body = json.dumps(
@@ -436,51 +431,29 @@ class Handler(BaseHTTPRequestHandler):
                         "pid": os.getpid(),
                         "max_retries": len(DELAYS),
                         "delays_seconds": DELAYS,
-                        "model_catalog_io_timeout_seconds": MODEL_CATALOG_TIMEOUT,
                     }
                 ).encode()
                 return self.reply(200, {"Content-Type": "application/json"}, body)
-            if self.command == "POST" and self.path == "/shutdown":
-                if self.headers.get("X-Codex-Retry-Control") != "stop":
-                    return self.reply(403, {}, b"Forbidden")
+            if (
+                self.command == "POST"
+                and self.path == "/shutdown"
+                and self.headers.get("X-Codex-Retry-Control") == "stop"
+            ):
                 self.reply(200, {}, b"Stopped")
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             parsed = urllib.parse.urlsplit(self.path)
-            websocket = (
-                self.command == "GET"
-                and parsed.path == PREFIX + "/responses"
-                and self.headers.get("Upgrade", "").lower() == "websocket"
-            )
-            if parsed.scheme or parsed.netloc or parsed.fragment or not parsed.path.startswith("/"):
-                return self.reply(404, {}, b"Unknown route")
-            if self.headers.get("Origin") or not self.headers.get("Authorization", "").startswith(
-                "Bearer "
-            ):
-                return self.reply(401, {}, b"OpenAI authentication required")
-            if websocket:
-                log_event("websocket_http_fallback")
-                return self.reply(
-                    426,
-                    {"Content-Type": "application/json"},
-                    b'{"error":{"message":"Use HTTP streaming for this local retry gateway"}}',
-                )
-            if self.headers.get("Transfer-Encoding"):
-                return self.reply(400, {}, b"Content-Length required")
+            if parsed.scheme and parsed.netloc:
+                self.path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                body = self.read_body()
             except ValueError:
-                return self.reply(400, {}, b"Invalid Content-Length")
-            if not 0 <= length <= MAX_BODY:
-                return self.reply(413, {}, b"Request too large")
-            body = self.rfile.read(length)
-            if len(body) != length:
-                return
+                return self.reply(400, {}, b"Invalid HTTP request framing")
             result = request_with_retry(
                 self.command,
                 self.path,
                 body,
-                dict(self.headers.items()),
+                self.headers,
                 self.cancelled,
                 self.pause,
             )
@@ -499,7 +472,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
-def configure(config_path, enable):
+def configure(config_path, enable, runtime=None):
     config_path = Path(config_path)
     if not config_path.exists():
         if not enable:
@@ -511,9 +484,10 @@ def configure(config_path, enable):
     newline = "\r\n" if "\r\n" in text else "\n"
     text = text.replace("\r\n", "\n")
     config = tomllib.loads(text)
-    runtime = config_path.parent / "transient-retry"
+    runtime = Path(runtime) if runtime is not None else config_path.parent / "transient-retry"
     state_path = runtime / "config-state.json"
-    runtime.mkdir(exist_ok=True)
+    legacy_state_path = config_path.parent / "transient-retry" / "config-state.json"
+    source_state_path = state_path if state_path.is_file() else legacy_state_path
     managed_header = next(
         (
             header
@@ -523,6 +497,28 @@ def configure(config_path, enable):
         None,
     )
     if managed_header:
+        managed_block = retained_tables = ""
+        end_marker = "# END CODEX TRANSIENT RETRY PROVIDER\n"
+        for block in (CONFIG_BLOCK, LEGACY_CONFIG_BLOCK):
+            prefix = block.removesuffix(end_marker)
+            start = text.find(prefix)
+            end = text.find(end_marker, start + len(prefix)) if start >= 0 else -1
+            if end < 0:
+                continue
+            tail = text[start + len(prefix) : end]
+            first_setting = next(
+                (
+                    line.strip()
+                    for line in tail.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")
+                ),
+                "",
+            )
+            if first_setting and not first_setting.startswith("["):
+                continue
+            managed_block = text[start : end + len(end_marker)]
+            retained_tables = tail
+            break
         expected_providers = (None, "openai") if managed_header == CONFIG_HEADER else (PROVIDER,)
         expected_url = (
             None
@@ -530,20 +526,47 @@ def configure(config_path, enable):
             else "http://127.0.0.1:18761/backend-api/codex"
         )
         if (
-            CONFIG_BLOCK not in text
-            or not state_path.is_file()
+            not source_state_path.is_file()
             or config.get("model_provider") not in expected_providers
             or config.get("openai_base_url") != expected_url
+            or (managed_header != CONFIG_HEADER and not managed_block)
+            or (not managed_block and "# BEGIN CODEX TRANSIENT RETRY PROVIDER" in text)
         ):
             raise ValueError("Existing retry configuration differs; refusing to overwrite it")
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(source_state_path.read_text(encoding="utf-8"))
+        replacement = (
+            ""
+            if managed_header == CONFIG_HEADER or PROVIDER_LINE_MARKER in text
+            else state["old_provider_line"]
+        )
+        restored = text.replace(managed_header, replacement, 1)
+        if managed_block:
+            restored = restored.replace(managed_block, retained_tables, 1)
+        restored = restored.replace(PROVIDER_LINE_MARKER, state["old_provider_line"], 1)
     elif "# BEGIN CODEX TRANSIENT RETRY" in text:
         raise ValueError("Retry settings were edited; refusing to overwrite user changes")
+    else:
+        restored = text
+    if not enable and not managed_header:
+        return {"enabled": False, "unchanged": True}
+    updated = CONFIG_HEADER + restored if enable else restored
+    updated_config = tomllib.loads(updated)
+    if enable and updated_config.get("model_provider") not in (None, "openai"):
+        raise ValueError("The original provider differs; refusing to replace it")
+    if managed_header and updated == text and source_state_path == state_path:
+        return {"enabled": enable, "unchanged": True, "backup": state["backup"]}
+    runtime.mkdir(parents=True, exist_ok=True)
     if enable:
         if managed_header:
-            if managed_header == CONFIG_HEADER:
-                return {"enabled": True, "unchanged": True, "backup": state["backup"]}
-            upgrade_backup = config_path.with_name(
+            old_backup = Path(state["backup"])
+            backup = runtime / old_backup.name
+            if old_backup.resolve() != backup.resolve():
+                if backup.exists() and backup.read_bytes() != old_backup.read_bytes():
+                    raise ValueError("A different configuration backup already exists")
+                if not backup.exists():
+                    shutil.copy2(old_backup, backup)
+            state["backup"] = str(backup)
+            upgrade_backup = runtime / (
                 config_path.name
                 + ".retry-upgrade-"
                 + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -552,8 +575,6 @@ def configure(config_path, enable):
             shutil.copy2(config_path, upgrade_backup)
             operation_backup = upgrade_backup
             state["upgrade_backup"] = str(upgrade_backup)
-            state_path.write_text(json.dumps(state), encoding="utf-8")
-            updated = text.replace(managed_header, CONFIG_HEADER + state["old_provider_line"], 1)
         else:
             if (
                 config.get("model_provider") not in (None, "openai")
@@ -563,7 +584,7 @@ def configure(config_path, enable):
                 raise ValueError(
                     "A different provider or base URL is configured; refusing to replace it"
                 )
-            backup = config_path.with_name(
+            backup = runtime / (
                 config_path.name
                 + ".retry-backup-"
                 + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -572,21 +593,22 @@ def configure(config_path, enable):
             shutil.copy2(config_path, backup)
             operation_backup = backup
             state = {"backup": str(backup), "old_provider_line": ""}
-            state_path.write_text(json.dumps(state), encoding="utf-8")
-            updated = CONFIG_HEADER + text + CONFIG_BLOCK
-    else:
-        if not managed_header:
-            return {"enabled": False, "unchanged": True}
-        replacement = "" if managed_header == CONFIG_HEADER else state["old_provider_line"]
-        updated = text.replace(managed_header, replacement, 1).replace(CONFIG_BLOCK, "", 1)
-    tomllib.loads(updated)
-    if config_path.read_bytes() != original:
-        raise ValueError("Configuration changed during setup; please retry")
-    temporary = config_path.with_name(config_path.name + ".retry-tmp")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
     applied = updated.replace("\n", newline).encode("utf-8")
-    temporary.write_bytes(applied)
-    shutil.copymode(config_path, temporary)
-    os.replace(temporary, config_path)
+    # Keep staging and backups out of the Codex config directory, even across volumes.
+    with config_path.open("r+b") as destination:
+        if destination.read() != original:
+            raise ValueError("Configuration changed during setup; please retry")
+        destination.seek(0)
+        try:
+            destination.write(applied)
+            destination.truncate()
+            destination.flush()
+        except OSError:
+            destination.seek(0)
+            destination.write(original)
+            destination.truncate()
+            raise
     result = {"enabled": enable, "backup": state["backup"]}
     if enable:
         result.update(
@@ -606,13 +628,18 @@ def main():
     )
     args = parser.parse_args()
     home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    runtime = Path(
+        os.environ.get(
+            "CODEX_RETRY_RUNTIME_DIR",
+            Path(__file__).resolve().parent / "local-diagnostics" / "transient-retry",
+        )
+    )
     if args.configure:
-        print(json.dumps(configure(home / "config.toml", args.configure == "enable")))
+        print(json.dumps(configure(home / "config.toml", args.configure == "enable", runtime)))
         return
     if not args.serve:
         parser.print_help()
         return
-    runtime = home / "transient-retry"
     runtime.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
         runtime / "proxy.log", maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
